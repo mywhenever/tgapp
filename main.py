@@ -2,7 +2,6 @@ import asyncio
 import json
 import random
 import re
-import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,20 +182,6 @@ class MainWindow(QMainWindow):
         self.user_ids_input.setPlaceholderText("123456789\n987654321")
         self.btn_add_users_only = QPushButton("Проверить и добавить пользователей")
 
-        # c2c connect
-        self.c2c_host_input = QLineEdit("127.0.0.1")
-        self.c2c_port_spin = QSpinBox()
-        self.c2c_port_spin.setRange(1, 65535)
-        self.c2c_port_spin.setValue(9000)
-        self.c2c_timeout_spin = QSpinBox()
-        self.c2c_timeout_spin.setRange(1, 60)
-        self.c2c_timeout_spin.setValue(5)
-        self.c2c_timeout_spin.setSuffix(" сек")
-        self.c2c_client_id_input = QLineEdit("client-1")
-        self.c2c_message_input = QLineEdit("ping")
-        self.btn_c2c_connect = QPushButton("Проверить C2C коннект")
-        self.btn_c2c_send = QPushButton("Отправить C2C сообщение")
-
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
 
@@ -206,7 +191,6 @@ class MainWindow(QMainWindow):
         self.page_accounts = QWidget()
         self.page_groups = QWidget()
         self.page_contacts = QWidget()
-        self.page_c2c = QWidget()
 
         self._build_tabs()
         self._bind_events()
@@ -220,12 +204,8 @@ class MainWindow(QMainWindow):
             "Иванов Иван Иванович 01.01.1990\nhttps://t.me/+79990001122\n\nПетров Петр 02.02.1992\nhttps://t.me/+79990001123"
         )
         self.usernames_input.setPlaceholderText("@durov\ntelegram\nhttps://t.me/example_username")
-        self.c2c_message_input.setPlaceholderText("Текст сообщения для C2C сервера")
 
         self.auth_delay_spin.setToolTip("Пауза перед отправкой кода и входом")
-        self.c2c_host_input.setToolTip("IP или домен C2C сервера")
-        self.c2c_port_spin.setToolTip("TCP порт C2C сервера")
-        self.c2c_timeout_spin.setToolTip("Таймаут подключения и чтения ответа")
         self.contacts_delay_min_spin.setToolTip("Минимальная пауза перед обработкой контактов")
         self.contacts_delay_max_spin.setToolTip("Максимальная пауза, если включён рандом")
         self.groups_delay_min_spin.setToolTip("Минимальная пауза перед созданием/действиями в группах")
@@ -255,11 +235,9 @@ class MainWindow(QMainWindow):
         self._build_accounts_page()
         self._build_groups_page()
         self._build_contacts_page()
-        self._build_c2c_page()
         self.tabs.addTab(self.page_accounts, "Аккаунты")
         self.tabs.addTab(self.page_groups, "Группы")
         self.tabs.addTab(self.page_contacts, "Контакты")
-        self.tabs.addTab(self.page_c2c, "C2C")
         self.tabs.currentChanged.connect(lambda i: self.statusBar().showMessage(f"Раздел: {self.tabs.tabText(i)}"))
         self.setCentralWidget(self.tabs)
 
@@ -419,31 +397,6 @@ class MainWindow(QMainWindow):
         i_l.addWidget(self.btn_add_users_only)
         layout.addWidget(ids_box)
 
-    def _build_c2c_page(self) -> None:
-        layout = QVBoxLayout(self.page_c2c)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        box = QGroupBox("C2C коннект с сервером")
-        form = QFormLayout(box)
-        form.addRow("Сервер", self.c2c_host_input)
-        form.addRow("Порт", self.c2c_port_spin)
-        form.addRow("Таймаут", self.c2c_timeout_spin)
-        form.addRow("Client ID", self.c2c_client_id_input)
-        form.addRow("Сообщение", self.c2c_message_input)
-
-        btn_row = QWidget()
-        btn_l = QHBoxLayout(btn_row)
-        btn_l.setContentsMargins(0, 0, 0, 0)
-        btn_l.addWidget(self.btn_c2c_connect)
-        btn_l.addWidget(self.btn_c2c_send)
-        btn_l.addStretch(1)
-        form.addRow("", btn_row)
-
-        form.addRow("", QLabel("Формат обмена: JSON в одной строке. Отправка происходит по TCP."))
-        layout.addWidget(box)
-        layout.addStretch(1)
-
     @staticmethod
     def _to_int(value: object, default: int) -> int:
         try:
@@ -486,8 +439,6 @@ class MainWindow(QMainWindow):
         self.btn_create_with_members.clicked.connect(lambda: self.create_groups(add_members=True))
         self.btn_create_without_members.clicked.connect(lambda: self.create_groups(add_members=False))
         self.btn_add_users_only.clicked.connect(self.add_users_without_groups)
-        self.btn_c2c_connect.clicked.connect(self.c2c_check_connection)
-        self.btn_c2c_send.clicked.connect(self.c2c_send_message)
 
         self.contacts_random_delay_checkbox.toggled.connect(
             lambda _: self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
@@ -526,12 +477,6 @@ class MainWindow(QMainWindow):
         self.group_contacts_input.textChanged.connect(self._save_settings)
         self.group_usernames_input.textChanged.connect(self._save_settings)
         self.group_user_ids_input.textChanged.connect(self._save_settings)
-
-        self.c2c_host_input.textChanged.connect(self._save_settings)
-        self.c2c_port_spin.valueChanged.connect(lambda _: self._save_settings())
-        self.c2c_timeout_spin.valueChanged.connect(lambda _: self._save_settings())
-        self.c2c_client_id_input.textChanged.connect(self._save_settings)
-        self.c2c_message_input.textChanged.connect(self._save_settings)
 
     def _load_settings(self) -> None:
         data = {}
@@ -584,13 +529,6 @@ class MainWindow(QMainWindow):
         self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
         self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
 
-        c2c = data.get("c2c", {}) if isinstance(data, dict) else {}
-        self.c2c_host_input.setText(str(c2c.get("host", self.c2c_host_input.text())).strip())
-        self.c2c_port_spin.setValue(self._to_int(c2c.get("port"), self.c2c_port_spin.value()))
-        self.c2c_timeout_spin.setValue(self._to_int(c2c.get("timeout"), self.c2c_timeout_spin.value()))
-        self.c2c_client_id_input.setText(str(c2c.get("client_id", self.c2c_client_id_input.text())).strip())
-        self.c2c_message_input.setText(str(c2c.get("message", self.c2c_message_input.text())))
-
         self._refresh_accounts_combo()
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
@@ -622,13 +560,6 @@ class MainWindow(QMainWindow):
                 "contacts": self.group_contacts_input.toPlainText(),
                 "usernames": self.group_usernames_input.toPlainText(),
                 "user_ids": self.group_user_ids_input.toPlainText(),
-            },
-            "c2c": {
-                "host": self.c2c_host_input.text().strip(),
-                "port": self.c2c_port_spin.value(),
-                "timeout": self.c2c_timeout_spin.value(),
-                "client_id": self.c2c_client_id_input.text().strip(),
-                "message": self.c2c_message_input.text(),
             },
         }
         SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -802,62 +733,8 @@ class MainWindow(QMainWindow):
             self.btn_create_with_members,
             self.btn_create_without_members,
             self.btn_add_users_only,
-            self.btn_c2c_connect,
-            self.btn_c2c_send,
         ]:
             btn.setEnabled(not busy)
-
-    def _run_c2c_request(self, message_type: str, message_text: str) -> None:
-        host = self.c2c_host_input.text().strip()
-        port = self.c2c_port_spin.value()
-        timeout = self.c2c_timeout_spin.value()
-        client_id = self.c2c_client_id_input.text().strip()
-
-        if not host:
-            self.show_error("Укажите C2C сервер")
-            return
-        if not client_id:
-            self.show_error("Укажите Client ID")
-            return
-
-        payload = {
-            "type": message_type,
-            "client_id": client_id,
-            "message": message_text,
-        }
-
-        def job() -> str:
-            data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-            with socket.create_connection((host, port), timeout=timeout) as conn:
-                conn.settimeout(timeout)
-                conn.sendall(data)
-
-                chunks: list[bytes] = []
-                while True:
-                    try:
-                        part = conn.recv(4096)
-                    except (TimeoutError, socket.timeout):
-                        break
-                    if not part:
-                        break
-                    chunks.append(part)
-                    if b"\n" in part:
-                        break
-
-            if not chunks:
-                return "Сообщение отправлено. Сервер не прислал ответ (таймаут/empty)."
-
-            response_raw = b"".join(chunks).split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
-            return f"C2C ответ сервера: {response_raw}"
-
-        self.log(f"C2C -> {host}:{port} | type={message_type}")
-        self.run_task(job, success_cb=lambda result: self.log(str(result)))
-
-    def c2c_check_connection(self) -> None:
-        self._run_c2c_request("c2c_hello", self.c2c_message_input.text())
-
-    def c2c_send_message(self) -> None:
-        self._run_c2c_request("c2c_message", self.c2c_message_input.text())
 
     def log(self, text: str) -> None:
         self.log_output.appendPlainText(text)
