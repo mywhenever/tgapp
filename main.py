@@ -197,8 +197,8 @@ class MainWindow(QMainWindow):
         self.groups_delay_min_spin.setToolTip("Минимальная пауза перед созданием/действиями в группах")
         self.groups_delay_max_spin.setToolTip("Максимальная пауза, если включён рандом")
 
-        self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
-        self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -399,22 +399,22 @@ class MainWindow(QMainWindow):
         self.btn_add_users_only.clicked.connect(self.add_users_without_groups)
 
         self.contacts_random_delay_checkbox.toggled.connect(
-            lambda _: self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         )
         self.groups_random_delay_checkbox.toggled.connect(
-            lambda _: self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         )
         self.contacts_delay_min_spin.valueChanged.connect(
-            lambda _: self._normalize_delay_range(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         )
         self.groups_delay_min_spin.valueChanged.connect(
-            lambda _: self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         )
         self.contacts_delay_max_spin.valueChanged.connect(
-            lambda _: self._normalize_delay_range_reverse(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         )
         self.groups_delay_max_spin.valueChanged.connect(
-            lambda _: self._normalize_delay_range_reverse(self.groups_delay_min_spin, self.groups_delay_max_spin)
+            lambda _: self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         )
 
         self.auth_delay_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
@@ -463,10 +463,8 @@ class MainWindow(QMainWindow):
         )
 
         self._refresh_accounts_combo()
-        self._normalize_delay_range(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
-        self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
-        self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
-        self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         self._loading_settings = False
 
     def _save_settings(self) -> None:
@@ -612,21 +610,16 @@ class MainWindow(QMainWindow):
             await asyncio.sleep(delay)
 
     @staticmethod
-    def _toggle_delay_max(random_checkbox: QCheckBox, min_spin: QSpinBox, max_spin: QSpinBox) -> None:
+    def _sync_delay_controls(random_checkbox: QCheckBox, min_spin: QSpinBox, max_spin: QSpinBox) -> None:
         is_random = random_checkbox.isChecked()
         max_spin.setEnabled(is_random)
+
         if not is_random:
             max_spin.setValue(min_spin.value())
+            return
 
-    @staticmethod
-    def _normalize_delay_range(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
-        if min_spin.value() > max_spin.value():
-            max_spin.setValue(min_spin.value())
-
-    @staticmethod
-    def _normalize_delay_range_reverse(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
         if max_spin.value() < min_spin.value():
-            min_spin.setValue(max_spin.value())
+            max_spin.setValue(min_spin.value())
 
     def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
         self.set_busy(True)
