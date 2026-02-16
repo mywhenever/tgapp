@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import re
 import sys
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ class MainWindow(QMainWindow):
 
         self.thread_pool = QThreadPool.globalInstance()
         self.phone_code_hash: Optional[str] = None
+        self._loading_settings = False
 
         # global app credentials (API ID + API HASH) used for login and all operations
         self.api_id_input = QLineEdit()
@@ -103,15 +105,40 @@ class MainWindow(QMainWindow):
         self.phone_input = QLineEdit()
         self.phone_input.setPlaceholderText("Телефон для входа")
         self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("Код из Telegram")
         self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Если включён 2FA")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.btn_request_code = QPushButton("Отправить код")
         self.btn_sign_in = QPushButton("Войти в аккаунт")
 
         # common
-        self.delay_spin = QSpinBox()
-        self.delay_spin.setRange(0, 120)
-        self.delay_spin.setSuffix(" сек")
+        self.auth_delay_spin = QSpinBox()
+        self.auth_delay_spin.setRange(0, 120)
+        self.auth_delay_spin.setSuffix(" сек")
+
+        # contacts delay
+        self.contacts_delay_min_spin = QSpinBox()
+        self.contacts_delay_min_spin.setRange(0, 120)
+        self.contacts_delay_min_spin.setSuffix(" сек")
+        self.contacts_delay_max_spin = QSpinBox()
+        self.contacts_delay_max_spin.setRange(0, 120)
+        self.contacts_delay_max_spin.setValue(3)
+        self.contacts_delay_max_spin.setSuffix(" сек")
+        self.contacts_random_delay_checkbox = QCheckBox("Рандомная задержка")
+        self.contacts_random_delay_checkbox.setChecked(True)
+
+        # groups delay
+        self.groups_delay_min_spin = QSpinBox()
+        self.groups_delay_min_spin.setRange(0, 120)
+        self.groups_delay_min_spin.setValue(1)
+        self.groups_delay_min_spin.setSuffix(" сек")
+        self.groups_delay_max_spin = QSpinBox()
+        self.groups_delay_max_spin.setRange(0, 120)
+        self.groups_delay_max_spin.setValue(5)
+        self.groups_delay_max_spin.setSuffix(" сек")
+        self.groups_random_delay_checkbox = QCheckBox("Рандомная задержка")
+        self.groups_random_delay_checkbox.setChecked(True)
 
         # groups
         self.group_title_input = QLineEdit("Новая супергруппа")
@@ -139,7 +166,7 @@ class MainWindow(QMainWindow):
         self.usernames_input.setPlaceholderText("@durov\ntelegram\nhttps://t.me/example_username")
         self.user_ids_input = QPlainTextEdit()
         self.user_ids_input.setPlaceholderText("123456789\n987654321")
-        self.btn_add_users_only = QPushButton("Добавить/проверить пользователей без групп")
+        self.btn_add_users_only = QPushButton("Проверить и добавить пользователей")
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
@@ -153,7 +180,25 @@ class MainWindow(QMainWindow):
 
         self._build_tabs()
         self._bind_events()
+        self._setup_ui_hints()
         self._load_settings()
+
+    def _setup_ui_hints(self) -> None:
+        self.statusBar().showMessage("Готово к работе")
+
+        self.contacts_input.setPlaceholderText(
+            "Иванов Иван Иванович 01.01.1990\nhttps://t.me/+79990001122\n\nПетров Петр 02.02.1992\nhttps://t.me/+79990001123"
+        )
+        self.usernames_input.setPlaceholderText("@durov\ntelegram\nhttps://t.me/example_username")
+
+        self.auth_delay_spin.setToolTip("Пауза перед отправкой кода и входом")
+        self.contacts_delay_min_spin.setToolTip("Минимальная пауза перед обработкой контактов")
+        self.contacts_delay_max_spin.setToolTip("Максимальная пауза, если включён рандом")
+        self.groups_delay_min_spin.setToolTip("Минимальная пауза перед созданием/действиями в группах")
+        self.groups_delay_max_spin.setToolTip("Максимальная пауза, если включён рандом")
+
+        self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -218,6 +263,7 @@ class MainWindow(QMainWindow):
 
         login_box = QGroupBox("Вход в аккаунт")
         login_form = QFormLayout(login_box)
+        login_form.addRow("", QLabel("1) Отправьте код  2) Введите код  3) Нажмите «Войти»"))
         login_form.addRow("Телефон для входа", self.phone_input)
 
         code_row = QWidget()
@@ -228,7 +274,7 @@ class MainWindow(QMainWindow):
         code_row_l.addWidget(self.btn_sign_in)
         login_form.addRow("Код", code_row)
         login_form.addRow("2FA пароль", self.password_input)
-        login_form.addRow("Задержка", self.delay_spin)
+        login_form.addRow("Задержка", self.auth_delay_spin)
         layout.addWidget(login_box)
 
         log_box = QGroupBox("Лог")
@@ -252,6 +298,17 @@ class MainWindow(QMainWindow):
         photo_l.addWidget(self.btn_pick_photo)
         form.addRow("Фото", photo_row)
         form.addRow("Участники", self.use_members_checkbox)
+
+        delay_row = QWidget()
+        delay_row_l = QHBoxLayout(delay_row)
+        delay_row_l.setContentsMargins(0, 0, 0, 0)
+        delay_row_l.addWidget(QLabel("от"))
+        delay_row_l.addWidget(self.groups_delay_min_spin)
+        delay_row_l.addWidget(QLabel("до"))
+        delay_row_l.addWidget(self.groups_delay_max_spin)
+        delay_row_l.addWidget(self.groups_random_delay_checkbox)
+        form.addRow("Задержка действий", delay_row)
+        form.addRow("", QLabel("Если рандом включён, пауза берётся случайно между от/до."))
         layout.addWidget(box)
 
         btn_row = QWidget()
@@ -283,8 +340,46 @@ class MainWindow(QMainWindow):
         i_l = QVBoxLayout(ids_box)
         self.user_ids_input.setFixedHeight(90)
         i_l.addWidget(self.user_ids_input)
+        i_l.addWidget(QLabel("Можно оставить пустым, если хотите работать только с контактами/username."))
+
+        delay_row = QWidget()
+        delay_row_l = QHBoxLayout(delay_row)
+        delay_row_l.setContentsMargins(0, 0, 0, 0)
+        delay_row_l.addWidget(QLabel("от"))
+        delay_row_l.addWidget(self.contacts_delay_min_spin)
+        delay_row_l.addWidget(QLabel("до"))
+        delay_row_l.addWidget(self.contacts_delay_max_spin)
+        delay_row_l.addWidget(self.contacts_random_delay_checkbox)
+        i_l.addWidget(QLabel("Задержка обработки контактов"))
+        i_l.addWidget(delay_row)
         i_l.addWidget(self.btn_add_users_only)
         layout.addWidget(ids_box)
+
+    @staticmethod
+    def _to_int(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "да"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "нет"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    def _on_delay_controls_changed(self) -> None:
+        if self._loading_settings:
+            return
+        self._save_settings()
 
     def _bind_events(self) -> None:
         self.btn_save_api.clicked.connect(self.save_api_pair)
@@ -302,6 +397,33 @@ class MainWindow(QMainWindow):
         self.btn_create_with_members.clicked.connect(lambda: self.create_groups(add_members=True))
         self.btn_create_without_members.clicked.connect(lambda: self.create_groups(add_members=False))
         self.btn_add_users_only.clicked.connect(self.add_users_without_groups)
+
+        self.contacts_random_delay_checkbox.toggled.connect(
+            lambda _: self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        )
+        self.groups_random_delay_checkbox.toggled.connect(
+            lambda _: self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        )
+        self.contacts_delay_min_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        )
+        self.groups_delay_min_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
+        )
+        self.contacts_delay_max_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range_reverse(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        )
+        self.groups_delay_max_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range_reverse(self.groups_delay_min_spin, self.groups_delay_max_spin)
+        )
+
+        self.auth_delay_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_delay_min_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_delay_max_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_random_delay_checkbox.toggled.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_delay_min_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_delay_max_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_random_delay_checkbox.toggled.connect(lambda _: self._on_delay_controls_changed())
 
     def _load_settings(self) -> None:
         data = {}
@@ -326,7 +448,26 @@ class MainWindow(QMainWindow):
             if phone and session:
                 self.accounts.append({"name": name or phone, "phone": phone, "session": session})
 
+        delays = data.get("delays", {}) if isinstance(data, dict) else {}
+        self._loading_settings = True
+        self.auth_delay_spin.setValue(self._to_int(delays.get("auth"), self.auth_delay_spin.value()))
+        self.contacts_delay_min_spin.setValue(self._to_int(delays.get("contacts_min"), self.contacts_delay_min_spin.value()))
+        self.contacts_delay_max_spin.setValue(self._to_int(delays.get("contacts_max"), self.contacts_delay_max_spin.value()))
+        self.contacts_random_delay_checkbox.setChecked(
+            self._to_bool(delays.get("contacts_random"), self.contacts_random_delay_checkbox.isChecked())
+        )
+        self.groups_delay_min_spin.setValue(self._to_int(delays.get("groups_min"), self.groups_delay_min_spin.value()))
+        self.groups_delay_max_spin.setValue(self._to_int(delays.get("groups_max"), self.groups_delay_max_spin.value()))
+        self.groups_random_delay_checkbox.setChecked(
+            self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
+        )
+
         self._refresh_accounts_combo()
+        self._normalize_delay_range(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._loading_settings = False
 
     def _save_settings(self) -> None:
         payload = {
@@ -335,6 +476,15 @@ class MainWindow(QMainWindow):
                 "api_hash": self.api_hash_input.text().strip(),
             },
             "accounts": self.accounts,
+            "delays": {
+                "auth": self.auth_delay_spin.value(),
+                "contacts_min": self.contacts_delay_min_spin.value(),
+                "contacts_max": self.contacts_delay_max_spin.value(),
+                "contacts_random": self.contacts_random_delay_checkbox.isChecked(),
+                "groups_min": self.groups_delay_min_spin.value(),
+                "groups_max": self.groups_delay_max_spin.value(),
+                "groups_random": self.groups_random_delay_checkbox.isChecked(),
+            },
         }
         SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -430,17 +580,62 @@ class MainWindow(QMainWindow):
         session = self.accounts[idx]["session"]
         return TelegramClient(session, int(api_id), api_hash)
 
-    async def wait_delay(self) -> None:
-        delay = self.delay_spin.value()
+    async def wait_auth_delay(self) -> None:
+        delay = self.auth_delay_spin.value()
         if delay > 0:
             await asyncio.sleep(delay)
 
+    @staticmethod
+    def _get_delay(min_delay: int, max_delay: int, randomize: bool) -> int:
+        left = min(min_delay, max_delay)
+        right = max(min_delay, max_delay)
+        if randomize:
+            return random.randint(left, right)
+        return left
+
+    async def wait_contacts_delay(self) -> None:
+        delay = self._get_delay(
+            self.contacts_delay_min_spin.value(),
+            self.contacts_delay_max_spin.value(),
+            self.contacts_random_delay_checkbox.isChecked(),
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def wait_groups_delay(self) -> None:
+        delay = self._get_delay(
+            self.groups_delay_min_spin.value(),
+            self.groups_delay_max_spin.value(),
+            self.groups_random_delay_checkbox.isChecked(),
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    @staticmethod
+    def _toggle_delay_max(random_checkbox: QCheckBox, min_spin: QSpinBox, max_spin: QSpinBox) -> None:
+        is_random = random_checkbox.isChecked()
+        max_spin.setEnabled(is_random)
+        if not is_random:
+            max_spin.setValue(min_spin.value())
+
+    @staticmethod
+    def _normalize_delay_range(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
+        if min_spin.value() > max_spin.value():
+            max_spin.setValue(min_spin.value())
+
+    @staticmethod
+    def _normalize_delay_range_reverse(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
+        if max_spin.value() < min_spin.value():
+            min_spin.setValue(max_spin.value())
+
     def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
         self.set_busy(True)
+        self.statusBar().showMessage("Выполняется операция, пожалуйста подождите...")
         task = AsyncTask(fn)
         task.signals.success.connect(lambda result: success_cb(result) if success_cb else None)
         task.signals.error.connect(self.show_error)
         task.signals.done.connect(lambda: self.set_busy(False))
+        task.signals.done.connect(lambda: self.statusBar().showMessage("Готово"))
         self.thread_pool.start(task)
 
     def set_busy(self, busy: bool) -> None:
@@ -540,13 +735,14 @@ class MainWindow(QMainWindow):
             async def _inner() -> str:
                 client = self._client_from_fields()
                 await client.connect()
-                await self.wait_delay()
+                await self.wait_auth_delay()
                 sent = await client.send_code_request(phone)
                 await client.disconnect()
                 return sent.phone_code_hash
 
             return asyncio.run(_inner())
 
+        self.log("Отправка кода...")
         self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("Код отправлен")))
 
     def sign_in(self) -> None:
@@ -561,7 +757,7 @@ class MainWindow(QMainWindow):
             async def _inner() -> str:
                 client = self._client_from_fields()
                 await client.connect()
-                await self.wait_delay()
+                await self.wait_auth_delay()
                 try:
                     await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
                     return "Успешный вход в аккаунт"
@@ -575,6 +771,7 @@ class MainWindow(QMainWindow):
 
             return asyncio.run(_inner())
 
+        self.log("Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
 
     def add_users_without_groups(self) -> None:
@@ -600,7 +797,7 @@ class MainWindow(QMainWindow):
 
                 logs = []
                 if contacts:
-                    await self.wait_delay()
+                    await self.wait_contacts_delay()
                     batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
                     imported = await client(ImportContactsRequest(batch))
                     logs.append(f"Импортировано контактов: {len(contacts)}")
@@ -609,7 +806,7 @@ class MainWindow(QMainWindow):
                 if refs:
                     ok, fail = 0, 0
                     for ref in refs:
-                        await self.wait_delay()
+                        await self.wait_contacts_delay()
                         try:
                             await client.get_entity(ref)
                             ok += 1
@@ -620,7 +817,7 @@ class MainWindow(QMainWindow):
                 if user_ids:
                     ok_ids, fail_ids = 0, 0
                     for uid in user_ids:
-                        await self.wait_delay()
+                        await self.wait_contacts_delay()
                         try:
                             await client.get_entity(uid)
                             ok_ids += 1
@@ -633,6 +830,7 @@ class MainWindow(QMainWindow):
 
             return asyncio.run(_inner())
 
+        self.log("Запущена обработка пользователей...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
 
     def create_groups(self, add_members: bool) -> None:
@@ -666,13 +864,13 @@ class MainWindow(QMainWindow):
                 logs: list[str] = []
                 if add_members:
                     if contacts:
-                        await self.wait_delay()
+                        await self.wait_contacts_delay()
                         batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
                         imported = await client(ImportContactsRequest(batch))
                         users_to_invite.extend([u for u in imported.users if not getattr(u, "bot", False)])
 
                     for ref in refs:
-                        await self.wait_delay()
+                        await self.wait_contacts_delay()
                         try:
                             ent = await client.get_entity(ref)
                             if not getattr(ent, "bot", False):
@@ -681,7 +879,7 @@ class MainWindow(QMainWindow):
                             pass
 
                     for uid in user_ids:
-                        await self.wait_delay()
+                        await self.wait_contacts_delay()
                         try:
                             ent = await client.get_entity(uid)
                             if not getattr(ent, "bot", False):
@@ -694,7 +892,7 @@ class MainWindow(QMainWindow):
                     logs.append(f"Подготовлено участников: {len(users_to_invite)}")
 
                 for i in range(cnt):
-                    await self.wait_delay()
+                    await self.wait_groups_delay()
                     gname = title if cnt == 1 else f"{title} #{i + 1}"
                     res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True))
                     channel = res.chats[0]
@@ -704,12 +902,12 @@ class MainWindow(QMainWindow):
                         p = Path(photo)
                         if not p.exists():
                             raise ValueError(f"Файл фото не найден: {photo}")
-                        await self.wait_delay()
+                        await self.wait_groups_delay()
                         uploaded = await client.upload_file(photo)
                         await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
 
                     if add_members and users_to_invite:
-                        await self.wait_delay()
+                        await self.wait_groups_delay()
                         await client(InviteToChannelRequest(channel=channel, users=users_to_invite))
                         logs.append(f"Добавлено участников в {gname}: {len(users_to_invite)}")
 
@@ -721,6 +919,7 @@ class MainWindow(QMainWindow):
 
             return asyncio.run(_inner())
 
+        self.log("Запущено создание групп...")
         self.run_task(job, success_cb=lambda result: (self.log(str(result)), QMessageBox.information(self, "Готово", "Операция выполнена")))
 
 
