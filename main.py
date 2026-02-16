@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
 
         self.thread_pool = QThreadPool.globalInstance()
         self.phone_code_hash: Optional[str] = None
+        self._loading_settings = False
 
         # global app credentials (API ID + API HASH) used for login and all operations
         self.api_id_input = QLineEdit()
@@ -354,6 +355,32 @@ class MainWindow(QMainWindow):
         i_l.addWidget(self.btn_add_users_only)
         layout.addWidget(ids_box)
 
+    @staticmethod
+    def _to_int(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "да"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "нет"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    def _on_delay_controls_changed(self) -> None:
+        if self._loading_settings:
+            return
+        self._save_settings()
+
     def _bind_events(self) -> None:
         self.btn_save_api.clicked.connect(self.save_api_pair)
 
@@ -383,6 +410,20 @@ class MainWindow(QMainWindow):
         self.groups_delay_min_spin.valueChanged.connect(
             lambda _: self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
         )
+        self.contacts_delay_max_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range_reverse(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        )
+        self.groups_delay_max_spin.valueChanged.connect(
+            lambda _: self._normalize_delay_range_reverse(self.groups_delay_min_spin, self.groups_delay_max_spin)
+        )
+
+        self.auth_delay_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_delay_min_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_delay_max_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.contacts_random_delay_checkbox.toggled.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_delay_min_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_delay_max_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
+        self.groups_random_delay_checkbox.toggled.connect(lambda _: self._on_delay_controls_changed())
 
     def _load_settings(self) -> None:
         data = {}
@@ -408,17 +449,25 @@ class MainWindow(QMainWindow):
                 self.accounts.append({"name": name or phone, "phone": phone, "session": session})
 
         delays = data.get("delays", {}) if isinstance(data, dict) else {}
-        self.auth_delay_spin.setValue(int(delays.get("auth", self.auth_delay_spin.value()) or 0))
-        self.contacts_delay_min_spin.setValue(int(delays.get("contacts_min", self.contacts_delay_min_spin.value()) or 0))
-        self.contacts_delay_max_spin.setValue(int(delays.get("contacts_max", self.contacts_delay_max_spin.value()) or 0))
-        self.contacts_random_delay_checkbox.setChecked(bool(delays.get("contacts_random", self.contacts_random_delay_checkbox.isChecked())))
-        self.groups_delay_min_spin.setValue(int(delays.get("groups_min", self.groups_delay_min_spin.value()) or 0))
-        self.groups_delay_max_spin.setValue(int(delays.get("groups_max", self.groups_delay_max_spin.value()) or 0))
-        self.groups_random_delay_checkbox.setChecked(bool(delays.get("groups_random", self.groups_random_delay_checkbox.isChecked())))
+        self._loading_settings = True
+        self.auth_delay_spin.setValue(self._to_int(delays.get("auth"), self.auth_delay_spin.value()))
+        self.contacts_delay_min_spin.setValue(self._to_int(delays.get("contacts_min"), self.contacts_delay_min_spin.value()))
+        self.contacts_delay_max_spin.setValue(self._to_int(delays.get("contacts_max"), self.contacts_delay_max_spin.value()))
+        self.contacts_random_delay_checkbox.setChecked(
+            self._to_bool(delays.get("contacts_random"), self.contacts_random_delay_checkbox.isChecked())
+        )
+        self.groups_delay_min_spin.setValue(self._to_int(delays.get("groups_min"), self.groups_delay_min_spin.value()))
+        self.groups_delay_max_spin.setValue(self._to_int(delays.get("groups_max"), self.groups_delay_max_spin.value()))
+        self.groups_random_delay_checkbox.setChecked(
+            self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
+        )
 
         self._refresh_accounts_combo()
+        self._normalize_delay_range(self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._normalize_delay_range(self.groups_delay_min_spin, self.groups_delay_max_spin)
         self._toggle_delay_max(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._toggle_delay_max(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._loading_settings = False
 
     def _save_settings(self) -> None:
         payload = {
@@ -573,6 +622,11 @@ class MainWindow(QMainWindow):
     def _normalize_delay_range(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
         if min_spin.value() > max_spin.value():
             max_spin.setValue(min_spin.value())
+
+    @staticmethod
+    def _normalize_delay_range_reverse(min_spin: QSpinBox, max_spin: QSpinBox) -> None:
+        if max_spin.value() < min_spin.value():
+            min_spin.setValue(max_spin.value())
 
     def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
         self.set_busy(True)
