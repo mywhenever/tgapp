@@ -90,9 +90,6 @@ class MainWindow(QMainWindow):
         # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
         self.account_phone_input.setPlaceholderText("+79990001122")
-        self.account_session_input = QLineEdit()
-        self.account_session_input.setPlaceholderText("session name, например: active_account")
-
         self.btn_save_account = QPushButton("Сохранить текущий аккаунт")
         self.btn_change_account = QPushButton("Сменить аккаунт")
 
@@ -263,7 +260,6 @@ class MainWindow(QMainWindow):
         menu_box = QGroupBox("Текущий Telegram аккаунт")
         menu_form = QFormLayout(menu_box)
         menu_form.addRow("Телефон", self.account_phone_input)
-        menu_form.addRow("Session", self.account_session_input)
 
         btn_row = QWidget()
         btn_row_l = QHBoxLayout(btn_row)
@@ -430,7 +426,6 @@ class MainWindow(QMainWindow):
         self.btn_change_account.clicked.connect(self.change_account)
         self.account_phone_input.textChanged.connect(lambda text: self.phone_input.setText(self.normalize_phone(text)))
         self.account_phone_input.textChanged.connect(self._save_settings)
-        self.account_session_input.textChanged.connect(self._save_settings)
 
         self.btn_request_code.clicked.connect(self.request_code)
         self.btn_sign_in.clicked.connect(self.sign_in)
@@ -502,7 +497,6 @@ class MainWindow(QMainWindow):
 
         account_phone = self.normalize_phone(str(account.get("phone", "")))
         self.account_phone_input.setText(account_phone)
-        self.account_session_input.setText(str(account.get("session", "")).strip())
         self.phone_input.setText(account_phone)
 
         delays = data.get("delays", {}) if isinstance(data, dict) else {}
@@ -554,7 +548,6 @@ class MainWindow(QMainWindow):
             },
             "account": {
                 "phone": self.account_phone_input.text().strip(),
-                "session": self.account_session_input.text().strip(),
             },
             "delays": {
                 "auth": self.auth_delay_spin.value(),
@@ -599,25 +592,23 @@ class MainWindow(QMainWindow):
 
     def save_account(self) -> None:
         phone = self.normalize_phone(self.account_phone_input.text())
-        session = self.account_session_input.text().strip()
-        if not phone or not session:
-            self.show_error("Для аккаунта обязательны телефон и session")
+        if not phone:
+            self.show_error("Для аккаунта обязателен телефон")
             return
 
         self.account_phone_input.setText(phone)
         self.phone_input.setText(phone)
         self._save_settings()
-        self.log("Текущий аккаунт сохранён")
+        self.log(f"Текущий аккаунт сохранён: {phone}")
 
     def change_account(self) -> None:
         self.phone_code_hash = None
         self.account_phone_input.clear()
-        self.account_session_input.clear()
         self.phone_input.clear()
         self.code_input.clear()
         self.password_input.clear()
         self._save_settings()
-        self.log("Режим смены аккаунта: введите новый телефон, session и снова выполните авторизацию")
+        self.log("Режим смены аккаунта: введите новый телефон и снова выполните авторизацию")
 
     def _client_from_fields(self) -> TelegramClient:
         api_id = self.api_id_input.text().strip()
@@ -625,9 +616,11 @@ class MainWindow(QMainWindow):
         if not api_id.isdigit() or not api_hash:
             raise ValueError("Сначала заполните API ID + API HASH")
 
-        session = self.account_session_input.text().strip()
-        if not session:
-            raise ValueError("Укажите session текущего аккаунта")
+        phone = self.normalize_phone(self.account_phone_input.text() or self.phone_input.text())
+        if not phone:
+            raise ValueError("Укажите телефон текущего аккаунта")
+
+        session = self.session_from_phone(phone)
         return TelegramClient(session, int(api_id), api_hash)
 
     async def wait_auth_delay(self) -> None:
@@ -763,6 +756,13 @@ class MainWindow(QMainWindow):
         return f"+{digits}" if digits else ""
 
     @staticmethod
+    def session_from_phone(phone: str) -> str:
+        digits = re.sub(r"\D", "", phone)
+        if not digits:
+            return "tg_session_default"
+        return f"tg_session_{digits}"
+
+    @staticmethod
     def parse_contacts(raw: str) -> list[ContactData]:
         lines = [line.strip() for line in raw.splitlines()]
         contacts: list[ContactData] = []
@@ -789,7 +789,9 @@ class MainWindow(QMainWindow):
             if not phone:
                 raise ValueError(f"Не удалось извлечь телефон: {link_line}")
 
-            contacts.append(ContactData(first_name=tokens[1], last_name=tokens[0], phone=phone))
+            first_name = " ".join(tokens[1:]) if len(tokens) > 1 else tokens[0]
+            last_name = tokens[0]
+            contacts.append(ContactData(first_name=first_name, last_name=last_name, phone=phone))
             i += 2
         return contacts
 
@@ -846,20 +848,26 @@ class MainWindow(QMainWindow):
             self.show_error("Введите телефон")
             return
         self.phone_input.setText(phone)
+        self.account_phone_input.setText(phone)
 
         def job() -> str:
             async def _inner() -> str:
+                self.log(f"[AUTH] Подготовка клиента для отправки кода. Телефон: {phone}")
                 client = self._client_from_fields()
+                self.log("[AUTH] Подключение к Telegram...")
                 await client.connect()
+                self.log("[AUTH] Подключение успешно")
                 await self.wait_auth_delay()
+                self.log("[AUTH] Запрос кода подтверждения...")
                 sent = await client.send_code_request(phone)
+                self.log("[AUTH] Код запрошен, отключение клиента")
                 await client.disconnect()
                 return sent.phone_code_hash
 
             return asyncio.run(_inner())
 
-        self.log("Отправка кода...")
-        self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("Код отправлен")))
+        self.log("[AUTH] Отправка кода...")
+        self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("[AUTH] Код отправлен")))
 
     def sign_in(self) -> None:
         phone = self.normalize_phone(self.phone_input.text())
@@ -871,23 +879,31 @@ class MainWindow(QMainWindow):
 
         def job() -> str:
             async def _inner() -> str:
+                self.log(f"[AUTH] Начало входа для {phone}")
                 client = self._client_from_fields()
+                self.log("[AUTH] Подключение к Telegram...")
                 await client.connect()
+                self.log("[AUTH] Подключение успешно")
                 await self.wait_auth_delay()
                 try:
+                    self.log("[AUTH] Выполняется sign_in по коду...")
                     await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
+                    self.log("[AUTH] Вход по коду выполнен")
                     return "Успешный вход в аккаунт"
                 except SessionPasswordNeededError:
+                    self.log("[AUTH] Требуется 2FA пароль")
                     if not pwd:
                         raise ValueError("Нужен 2FA пароль")
                     await client.sign_in(password=pwd)
+                    self.log("[AUTH] Вход по 2FA выполнен")
                     return "Успешный вход по 2FA"
                 finally:
+                    self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
             return asyncio.run(_inner())
 
-        self.log("Выполняется вход...")
+        self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
 
     def add_users_without_groups(self) -> None:
@@ -911,34 +927,45 @@ class MainWindow(QMainWindow):
                     await client.disconnect()
                     raise ValueError("Сначала выполните вход")
 
-                logs = []
+                logs = [
+                    f"Старт обработки пользователей: contacts={len(contacts)}, refs={len(refs)}, ids={len(user_ids)}",
+                    "Проверка авторизации: успешно",
+                ]
                 if contacts:
+                    logs.append("Импорт контактов: старт")
                     await self.wait_contacts_delay()
                     batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
                     imported = await client(ImportContactsRequest(batch))
+                    logs.append(f"Импорт контактов: отправлено {len(batch)}")
                     logs.append(f"Импортировано контактов: {len(contacts)}")
                     logs.append(f"Telegram-профилей найдено: {len(imported.users)}")
 
                 if refs:
+                    logs.append("Проверка username/ссылок: старт")
                     ok, fail = 0, 0
                     for ref in refs:
                         await self.wait_contacts_delay()
                         try:
                             await self._get_entity_with_retry(client, ref)
                             ok += 1
-                        except Exception:
+                            logs.append(f"username/link OK: {ref}")
+                        except Exception as exc:
                             fail += 1
+                            logs.append(f"username/link FAIL: {ref} ({exc})")
                     logs.append(f"Проверка username/ссылок: ok={ok}, fail={fail}")
 
                 if user_ids:
+                    logs.append("Проверка user ID: старт")
                     ok_ids, fail_ids = 0, 0
                     for uid in user_ids:
                         await self.wait_contacts_delay()
                         try:
                             await self._get_entity_with_retry(client, uid)
                             ok_ids += 1
-                        except Exception:
+                            logs.append(f"user ID OK: {uid}")
+                        except Exception as exc:
                             fail_ids += 1
+                            logs.append(f"user ID FAIL: {uid} ({exc})")
                     logs.append(f"Проверка user ID: ok={ok_ids}, fail={fail_ids}")
 
                 await client.disconnect()
@@ -1004,13 +1031,16 @@ class MainWindow(QMainWindow):
                     raise ValueError("Сначала выполните вход")
 
                 users_to_invite = []
-                logs: list[str] = []
+                logs: list[str] = [f"Старт создания групп: count={cnt}, add_members={add_members}, forum={is_forum}"]
                 if add_members:
                     if contacts:
+                        logs.append(f"Подготовка участников из контактов: {len(contacts)}")
                         await self.wait_contacts_delay()
                         batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
                         imported = await client(ImportContactsRequest(batch))
-                        users_to_invite.extend([u for u in imported.users if not getattr(u, "bot", False)])
+                        from_contacts = [u for u in imported.users if not getattr(u, "bot", False)]
+                        users_to_invite.extend(from_contacts)
+                        logs.append(f"Получено пользователей из контактов: {len(from_contacts)}")
 
                     for ref in refs:
                         await self.wait_contacts_delay()
@@ -1018,8 +1048,9 @@ class MainWindow(QMainWindow):
                             ent = await self._get_entity_with_retry(client, ref)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
-                        except Exception:
-                            pass
+                                logs.append(f"Добавлен кандидат по username/link: {ref}")
+                        except Exception as exc:
+                            logs.append(f"Не удалось получить username/link {ref}: {exc}")
 
                     for uid in user_ids:
                         await self.wait_contacts_delay()
@@ -1027,12 +1058,13 @@ class MainWindow(QMainWindow):
                             ent = await self._get_entity_with_retry(client, uid)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
-                        except Exception:
-                            pass
+                                logs.append(f"Добавлен кандидат по user ID: {uid}")
+                        except Exception as exc:
+                            logs.append(f"Не удалось получить user ID {uid}: {exc}")
 
                     uniq = {getattr(u, "id", None): u for u in users_to_invite if getattr(u, "id", None) is not None}
                     users_to_invite = list(uniq.values())
-                    logs.append(f"Подготовлено участников: {len(users_to_invite)}")
+                    logs.append(f"Подготовлено участников после дедупликации: {len(users_to_invite)}")
 
                 for i in range(cnt):
                     await self.wait_groups_delay()

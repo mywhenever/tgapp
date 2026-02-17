@@ -100,7 +100,7 @@ def test_parse_contacts_success() -> None:
     raw = "Иванов Иван Иванович 01.01.1990\nhttps://t.me/+79990001122"
     contacts = MainWindow.parse_contacts(raw)
     assert len(contacts) == 1
-    assert contacts[0].first_name == "Иван"
+    assert contacts[0].first_name == "Иван Иванович"
     assert contacts[0].last_name == "Иванов"
     assert contacts[0].phone == "+79990001122"
 
@@ -164,3 +164,7 @@ def test_retry_async_validates_attempts() -> None:
 
     with pytest.raises(ValueError, match="attempts"):
         asyncio.run(MainWindow.retry_async(op, attempts=0))
+
+
+def test_session_from_phone_uses_digits_only() -> None:
+    assert MainWindow.session_from_phone("+7 (999) 000-11-22") == "tg_session_79990001122"
