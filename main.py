@@ -5,7 +5,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtWidgets import (
@@ -34,6 +34,9 @@ from telethon.tl.functions.contacts import ImportContactsRequest
 from telethon.tl.types import InputChatUploadedPhoto, InputPhoneContact
 
 SETTINGS_FILE = Path("app_settings.json")
+
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.7
 
 
 @dataclass
@@ -669,6 +672,36 @@ class MainWindow(QMainWindow):
             return random.randint(left, right)
         return left
 
+    @staticmethod
+    async def retry_async(
+        operation: Callable[[], Awaitable[object]],
+        *,
+        attempts: int = RETRY_ATTEMPTS,
+        base_delay: float = RETRY_BASE_DELAY,
+        retry_exceptions: tuple[type[BaseException], ...] = (Exception,),
+        on_retry: Optional[Callable[[int, BaseException], None]] = None,
+    ) -> object:
+        if attempts < 1:
+            raise ValueError("attempts должен быть >= 1")
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except retry_exceptions as exc:  # noqa: PERF203
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+                if on_retry:
+                    on_retry(attempt, exc)
+                delay = base_delay * attempt
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("retry_async завершился без результата")
+
     async def wait_contacts_delay(self) -> None:
         delay = self._get_delay(
             self.contacts_delay_min_spin.value(),
@@ -801,6 +834,17 @@ class MainWindow(QMainWindow):
             ids.append(int(v))
         return ids
 
+    async def _get_entity_with_retry(self, client: TelegramClient, value: str | int):
+        async def _op():
+            return await client.get_entity(value)
+
+        return await self.retry_async(
+            _op,
+            attempts=RETRY_ATTEMPTS,
+            base_delay=RETRY_BASE_DELAY,
+            on_retry=lambda attempt, exc: self.log(f"retry get_entity({value}) attempt={attempt + 1}: {exc}"),
+        )
+
     def pick_photo(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.jpg *.jpeg *.png *.webp)")
         if p:
@@ -889,7 +933,7 @@ class MainWindow(QMainWindow):
                     for ref in refs:
                         await self.wait_contacts_delay()
                         try:
-                            await client.get_entity(ref)
+                            await self._get_entity_with_retry(client, ref)
                             ok += 1
                         except Exception:
                             fail += 1
@@ -900,7 +944,7 @@ class MainWindow(QMainWindow):
                     for uid in user_ids:
                         await self.wait_contacts_delay()
                         try:
-                            await client.get_entity(uid)
+                            await self._get_entity_with_retry(client, uid)
                             ok_ids += 1
                         except Exception:
                             fail_ids += 1
@@ -978,7 +1022,7 @@ class MainWindow(QMainWindow):
                     for ref in refs:
                         await self.wait_contacts_delay()
                         try:
-                            ent = await client.get_entity(ref)
+                            ent = await self._get_entity_with_retry(client, ref)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
                         except Exception:
@@ -987,7 +1031,7 @@ class MainWindow(QMainWindow):
                     for uid in user_ids:
                         await self.wait_contacts_delay()
                         try:
-                            ent = await client.get_entity(uid)
+                            ent = await self._get_entity_with_retry(client, uid)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
                         except Exception:
