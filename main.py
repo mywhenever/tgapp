@@ -3,6 +3,7 @@ import json
 import random
 import re
 import sys
+import threading
 from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,7 @@ SETTINGS_FILE = Path("app_settings.json")
 
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 0.7
+TELEGRAM_SESSION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -77,6 +79,11 @@ class MainWindow(QMainWindow):
         self._apply_styles()
 
         self.thread_pool = QThreadPool.globalInstance()
+        # Telethon stores session data in SQLite.
+        # A single worker and a process-wide lock prevent concurrent writes
+        # that can trigger "database is locked" errors for the same session.
+        self.thread_pool.setMaxThreadCount(1)
+        self._telegram_session_lock = TELEGRAM_SESSION_LOCK
         self.phone_code_hash: Optional[str] = None
         self._loading_settings = False
 
@@ -730,6 +737,10 @@ class MainWindow(QMainWindow):
         task.signals.done.connect(lambda: self.statusBar().showMessage("Готово"))
         self.thread_pool.start(task)
 
+    def _run_serialized_telegram_job(self, action: Callable[[], str]) -> str:
+        with self._telegram_session_lock:
+            return action()
+
     def set_busy(self, busy: bool) -> None:
         for btn in [
             self.btn_save_api,
@@ -861,17 +872,20 @@ class MainWindow(QMainWindow):
             async def _inner() -> str:
                 self.log(f"[AUTH] Подготовка клиента для отправки кода. Телефон: {phone}")
                 client = self._client_from_fields()
-                self.log("[AUTH] Подключение к Telegram...")
-                await client.connect()
-                self.log("[AUTH] Подключение успешно")
-                await self.wait_auth_delay()
-                self.log("[AUTH] Запрос кода подтверждения...")
-                sent = await client.send_code_request(phone)
-                self.log("[AUTH] Код запрошен, отключение клиента")
-                await client.disconnect()
-                return sent.phone_code_hash
+                try:
+                    self.log("[AUTH] Подключение к Telegram...")
+                    await client.connect()
+                    self.log("[AUTH] Подключение успешно")
+                    await self.wait_auth_delay()
+                    self.log("[AUTH] Запрос кода подтверждения...")
+                    sent = await client.send_code_request(phone)
+                    self.log("[AUTH] Код запрошен")
+                    return sent.phone_code_hash
+                finally:
+                    self.log("[AUTH] Отключение клиента")
+                    await client.disconnect()
 
-            return asyncio.run(_inner())
+            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
 
         self.log("[AUTH] Отправка кода...")
         self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("[AUTH] Код отправлен")))
@@ -888,27 +902,28 @@ class MainWindow(QMainWindow):
             async def _inner() -> str:
                 self.log(f"[AUTH] Начало входа для {phone}")
                 client = self._client_from_fields()
-                self.log("[AUTH] Подключение к Telegram...")
-                await client.connect()
-                self.log("[AUTH] Подключение успешно")
-                await self.wait_auth_delay()
                 try:
-                    self.log("[AUTH] Выполняется sign_in по коду...")
-                    await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
-                    self.log("[AUTH] Вход по коду выполнен")
-                    return "Успешный вход в аккаунт"
-                except SessionPasswordNeededError:
-                    self.log("[AUTH] Требуется 2FA пароль")
-                    if not pwd:
-                        raise ValueError("Нужен 2FA пароль")
-                    await client.sign_in(password=pwd)
-                    self.log("[AUTH] Вход по 2FA выполнен")
-                    return "Успешный вход по 2FA"
+                    self.log("[AUTH] Подключение к Telegram...")
+                    await client.connect()
+                    self.log("[AUTH] Подключение успешно")
+                    await self.wait_auth_delay()
+                    try:
+                        self.log("[AUTH] Выполняется sign_in по коду...")
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
+                        self.log("[AUTH] Вход по коду выполнен")
+                        return "Успешный вход в аккаунт"
+                    except SessionPasswordNeededError:
+                        self.log("[AUTH] Требуется 2FA пароль")
+                        if not pwd:
+                            raise ValueError("Нужен 2FA пароль")
+                        await client.sign_in(password=pwd)
+                        self.log("[AUTH] Вход по 2FA выполнен")
+                        return "Успешный вход по 2FA"
                 finally:
                     self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
-            return asyncio.run(_inner())
+            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
 
         self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
@@ -929,56 +944,57 @@ class MainWindow(QMainWindow):
         def job() -> str:
             async def _inner() -> str:
                 client = self._client_from_fields()
-                await client.connect()
-                if not await client.is_user_authorized():
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise ValueError("Сначала выполните вход")
+
+                    logs = [
+                        f"Старт обработки пользователей: contacts={len(contacts)}, refs={len(refs)}, ids={len(user_ids)}",
+                        "Проверка авторизации: успешно",
+                    ]
+                    if contacts:
+                        logs.append("Импорт контактов: старт")
+                        await self.wait_contacts_delay()
+                        batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
+                        imported = await client(ImportContactsRequest(batch))
+                        logs.append(f"Импорт контактов: отправлено {len(batch)}")
+                        logs.append(f"Импортировано контактов: {len(contacts)}")
+                        logs.append(f"Telegram-профилей найдено: {len(imported.users)}")
+
+                    if refs:
+                        logs.append("Проверка username/ссылок: старт")
+                        ok, fail = 0, 0
+                        for ref in refs:
+                            await self.wait_contacts_delay()
+                            try:
+                                await self._get_entity_with_retry(client, ref)
+                                ok += 1
+                                logs.append(f"username/link OK: {ref}")
+                            except Exception as exc:
+                                fail += 1
+                                logs.append(f"username/link FAIL: {ref} ({exc})")
+                        logs.append(f"Проверка username/ссылок: ok={ok}, fail={fail}")
+
+                    if user_ids:
+                        logs.append("Проверка user ID: старт")
+                        ok_ids, fail_ids = 0, 0
+                        for uid in user_ids:
+                            await self.wait_contacts_delay()
+                            try:
+                                await self._get_entity_with_retry(client, uid)
+                                ok_ids += 1
+                                logs.append(f"user ID OK: {uid}")
+                            except Exception as exc:
+                                fail_ids += 1
+                                logs.append(f"user ID FAIL: {uid} ({exc})")
+                        logs.append(f"Проверка user ID: ok={ok_ids}, fail={fail_ids}")
+
+                    return "\n".join(logs) if logs else "Нет данных для обработки"
+                finally:
                     await client.disconnect()
-                    raise ValueError("Сначала выполните вход")
 
-                logs = [
-                    f"Старт обработки пользователей: contacts={len(contacts)}, refs={len(refs)}, ids={len(user_ids)}",
-                    "Проверка авторизации: успешно",
-                ]
-                if contacts:
-                    logs.append("Импорт контактов: старт")
-                    await self.wait_contacts_delay()
-                    batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
-                    imported = await client(ImportContactsRequest(batch))
-                    logs.append(f"Импорт контактов: отправлено {len(batch)}")
-                    logs.append(f"Импортировано контактов: {len(contacts)}")
-                    logs.append(f"Telegram-профилей найдено: {len(imported.users)}")
-
-                if refs:
-                    logs.append("Проверка username/ссылок: старт")
-                    ok, fail = 0, 0
-                    for ref in refs:
-                        await self.wait_contacts_delay()
-                        try:
-                            await self._get_entity_with_retry(client, ref)
-                            ok += 1
-                            logs.append(f"username/link OK: {ref}")
-                        except Exception as exc:
-                            fail += 1
-                            logs.append(f"username/link FAIL: {ref} ({exc})")
-                    logs.append(f"Проверка username/ссылок: ok={ok}, fail={fail}")
-
-                if user_ids:
-                    logs.append("Проверка user ID: старт")
-                    ok_ids, fail_ids = 0, 0
-                    for uid in user_ids:
-                        await self.wait_contacts_delay()
-                        try:
-                            await self._get_entity_with_retry(client, uid)
-                            ok_ids += 1
-                            logs.append(f"user ID OK: {uid}")
-                        except Exception as exc:
-                            fail_ids += 1
-                            logs.append(f"user ID FAIL: {uid} ({exc})")
-                    logs.append(f"Проверка user ID: ok={ok_ids}, fail={fail_ids}")
-
-                await client.disconnect()
-                return "\n".join(logs) if logs else "Нет данных для обработки"
-
-            return asyncio.run(_inner())
+            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
 
         self.log("Запущена обработка пользователей...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)), block_ui=False)
@@ -1032,81 +1048,82 @@ class MainWindow(QMainWindow):
         def job() -> str:
             async def _inner() -> str:
                 client = self._client_from_fields()
-                await client.connect()
-                if not await client.is_user_authorized():
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise ValueError("Сначала выполните вход")
+
+                    users_to_invite = []
+                    logs: list[str] = [f"Старт создания групп: count={cnt}, add_members={add_members}, forum={is_forum}"]
+                    if add_members:
+                        if contacts:
+                            logs.append(f"Подготовка участников из контактов: {len(contacts)}")
+                            await self.wait_contacts_delay()
+                            batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
+                            imported = await client(ImportContactsRequest(batch))
+                            from_contacts = [u for u in imported.users if not getattr(u, "bot", False)]
+                            users_to_invite.extend(from_contacts)
+                            logs.append(f"Получено пользователей из контактов: {len(from_contacts)}")
+
+                        for ref in refs:
+                            await self.wait_contacts_delay()
+                            try:
+                                ent = await self._get_entity_with_retry(client, ref)
+                                if not getattr(ent, "bot", False):
+                                    users_to_invite.append(ent)
+                                    logs.append(f"Добавлен кандидат по username/link: {ref}")
+                            except Exception as exc:
+                                logs.append(f"Не удалось получить username/link {ref}: {exc}")
+
+                        for uid in user_ids:
+                            await self.wait_contacts_delay()
+                            try:
+                                ent = await self._get_entity_with_retry(client, uid)
+                                if not getattr(ent, "bot", False):
+                                    users_to_invite.append(ent)
+                                    logs.append(f"Добавлен кандидат по user ID: {uid}")
+                            except Exception as exc:
+                                logs.append(f"Не удалось получить user ID {uid}: {exc}")
+
+                        uniq = {getattr(u, "id", None): u for u in users_to_invite if getattr(u, "id", None) is not None}
+                        users_to_invite = list(uniq.values())
+                        logs.append(f"Подготовлено участников после дедупликации: {len(users_to_invite)}")
+
+                    for i in range(cnt):
+                        await self.wait_groups_delay()
+                        gname = title
+                        res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
+                        channel = res.chats[0]
+                        logs.append(f"Создана группа: {gname}")
+
+                        if is_forum and topic_title:
+                            await self.wait_groups_delay()
+                            messages_mod = import_module("telethon.tl.functions.messages")
+                            create_topic_request = getattr(messages_mod, "CreateForumTopicRequest")
+                            await client(create_topic_request(peer=channel, title=topic_title))
+                            logs.append(f"Создана тема в {gname}: {topic_title}")
+
+                        if photo:
+                            p = Path(photo)
+                            if not p.exists():
+                                raise ValueError(f"Файл фото не найден: {photo}")
+                            await self.wait_groups_delay()
+                            uploaded = await client.upload_file(photo)
+                            await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
+
+                        if add_members and users_to_invite:
+                            await self.wait_groups_delay()
+                            await client(InviteToChannelRequest(channel=channel, users=users_to_invite))
+                            logs.append(f"Добавлено участников в {gname}: {len(users_to_invite)}")
+
+                    if not add_members:
+                        logs.append("Группы созданы без участников")
+
+                    return "\n".join(logs)
+                finally:
                     await client.disconnect()
-                    raise ValueError("Сначала выполните вход")
 
-                users_to_invite = []
-                logs: list[str] = [f"Старт создания групп: count={cnt}, add_members={add_members}, forum={is_forum}"]
-                if add_members:
-                    if contacts:
-                        logs.append(f"Подготовка участников из контактов: {len(contacts)}")
-                        await self.wait_contacts_delay()
-                        batch = [InputPhoneContact(client_id=i + 1, phone=c.phone, first_name=c.first_name, last_name=c.last_name) for i, c in enumerate(contacts)]
-                        imported = await client(ImportContactsRequest(batch))
-                        from_contacts = [u for u in imported.users if not getattr(u, "bot", False)]
-                        users_to_invite.extend(from_contacts)
-                        logs.append(f"Получено пользователей из контактов: {len(from_contacts)}")
-
-                    for ref in refs:
-                        await self.wait_contacts_delay()
-                        try:
-                            ent = await self._get_entity_with_retry(client, ref)
-                            if not getattr(ent, "bot", False):
-                                users_to_invite.append(ent)
-                                logs.append(f"Добавлен кандидат по username/link: {ref}")
-                        except Exception as exc:
-                            logs.append(f"Не удалось получить username/link {ref}: {exc}")
-
-                    for uid in user_ids:
-                        await self.wait_contacts_delay()
-                        try:
-                            ent = await self._get_entity_with_retry(client, uid)
-                            if not getattr(ent, "bot", False):
-                                users_to_invite.append(ent)
-                                logs.append(f"Добавлен кандидат по user ID: {uid}")
-                        except Exception as exc:
-                            logs.append(f"Не удалось получить user ID {uid}: {exc}")
-
-                    uniq = {getattr(u, "id", None): u for u in users_to_invite if getattr(u, "id", None) is not None}
-                    users_to_invite = list(uniq.values())
-                    logs.append(f"Подготовлено участников после дедупликации: {len(users_to_invite)}")
-
-                for i in range(cnt):
-                    await self.wait_groups_delay()
-                    gname = title
-                    res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
-                    channel = res.chats[0]
-                    logs.append(f"Создана группа: {gname}")
-
-                    if is_forum and topic_title:
-                        await self.wait_groups_delay()
-                        messages_mod = import_module("telethon.tl.functions.messages")
-                        create_topic_request = getattr(messages_mod, "CreateForumTopicRequest")
-                        await client(create_topic_request(peer=channel, title=topic_title))
-                        logs.append(f"Создана тема в {gname}: {topic_title}")
-
-                    if photo:
-                        p = Path(photo)
-                        if not p.exists():
-                            raise ValueError(f"Файл фото не найден: {photo}")
-                        await self.wait_groups_delay()
-                        uploaded = await client.upload_file(photo)
-                        await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
-
-                    if add_members and users_to_invite:
-                        await self.wait_groups_delay()
-                        await client(InviteToChannelRequest(channel=channel, users=users_to_invite))
-                        logs.append(f"Добавлено участников в {gname}: {len(users_to_invite)}")
-
-                if not add_members:
-                    logs.append("Группы созданы без участников")
-
-                await client.disconnect()
-                return "\n".join(logs)
-
-            return asyncio.run(_inner())
+            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
 
         self.log("Запущено создание групп...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
