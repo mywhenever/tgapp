@@ -3,6 +3,7 @@ import json
 import random
 import re
 import sys
+from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -149,6 +150,17 @@ class MainWindow(QMainWindow):
         self.group_count_spin = QSpinBox()
         self.group_count_spin.setRange(1, 100)
         self.group_count_spin.setValue(1)
+        self.group_type_combo = QComboBox()
+        self.group_type_combo.addItem("Обычная супергруппа", "normal")
+        self.group_type_combo.addItem("Группа с темами (форум)", "forum")
+        self.topic_preset_combo = QComboBox()
+        self.topic_preset_combo.addItem("Без дополнительной темы", "")
+        self.topic_preset_combo.addItem("Общение", "Общение")
+        self.topic_preset_combo.addItem("Вопросы и ответы", "Вопросы и ответы")
+        self.topic_preset_combo.addItem("Новости", "Новости")
+        self.topic_preset_combo.addItem("Поддержка", "Поддержка")
+        self.topic_custom_input = QLineEdit()
+        self.topic_custom_input.setPlaceholderText("Своя тема (опционально)")
         self.photo_path_input = QLineEdit()
         self.photo_path_input.setPlaceholderText("Фото опционально")
         self.btn_pick_photo = QPushButton("Выбрать фото")
@@ -216,6 +228,7 @@ class MainWindow(QMainWindow):
 
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_forum_controls()
         self._sync_group_member_inputs()
 
     def _apply_styles(self) -> None:
@@ -309,6 +322,9 @@ class MainWindow(QMainWindow):
         form.addRow("Название", self.group_title_input)
         form.addRow("Описание", self.group_about_input)
         form.addRow("Количество групп", self.group_count_spin)
+        form.addRow("Тип группы", self.group_type_combo)
+        form.addRow("Тема (из списка)", self.topic_preset_combo)
+        form.addRow("Тема (своя)", self.topic_custom_input)
         photo_row = QWidget()
         photo_l = QHBoxLayout(photo_row)
         photo_l.setContentsMargins(0, 0, 0, 0)
@@ -461,6 +477,7 @@ class MainWindow(QMainWindow):
         self.groups_delay_max_spin.valueChanged.connect(
             lambda _: self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         )
+        self.group_type_combo.currentIndexChanged.connect(lambda _: self._sync_forum_controls())
 
         self.auth_delay_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
         self.contacts_delay_min_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
@@ -477,6 +494,9 @@ class MainWindow(QMainWindow):
         self.group_use_contacts_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
         self.group_use_usernames_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
         self.group_use_ids_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
+        self.group_type_combo.currentIndexChanged.connect(lambda _: self._save_settings())
+        self.topic_preset_combo.currentIndexChanged.connect(lambda _: self._save_settings())
+        self.topic_custom_input.textChanged.connect(self._save_settings)
         self.group_contacts_input.textChanged.connect(self._save_settings)
         self.group_usernames_input.textChanged.connect(self._save_settings)
         self.group_user_ids_input.textChanged.connect(self._save_settings)
@@ -532,9 +552,15 @@ class MainWindow(QMainWindow):
         self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
         self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
 
+        group_options = data.get("group_options", {}) if isinstance(data, dict) else {}
+        self._set_combo_by_data(self.group_type_combo, str(group_options.get("type", "normal")))
+        self._set_combo_by_data(self.topic_preset_combo, str(group_options.get("topic_preset", "")))
+        self.topic_custom_input.setText(str(group_options.get("topic_custom", "")))
+
         self._refresh_accounts_combo()
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_forum_controls()
         self._sync_group_member_inputs()
         self._loading_settings = False
 
@@ -564,8 +590,17 @@ class MainWindow(QMainWindow):
                 "usernames": self.group_usernames_input.toPlainText(),
                 "user_ids": self.group_user_ids_input.toPlainText(),
             },
+            "group_options": {
+                "type": self.group_type_combo.currentData(),
+                "topic_preset": self.topic_preset_combo.currentData(),
+                "topic_custom": self.topic_custom_input.text().strip(),
+            },
         }
         SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _set_combo_by_data(self, combo: QComboBox, value: str) -> None:
+        idx = combo.findData(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def save_api_pair(self) -> None:
         api_id = self.api_id_input.text().strip()
@@ -741,6 +776,11 @@ class MainWindow(QMainWindow):
         self.group_contacts_input.setEnabled(contacts_enabled)
         self.group_usernames_input.setEnabled(refs_enabled)
         self.group_user_ids_input.setEnabled(ids_enabled)
+
+    def _sync_forum_controls(self) -> None:
+        is_forum = self.group_type_combo.currentData() == "forum"
+        self.topic_preset_combo.setEnabled(is_forum)
+        self.topic_custom_input.setEnabled(is_forum)
 
     def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
         self.set_busy(True)
@@ -963,6 +1003,8 @@ class MainWindow(QMainWindow):
         about = self.group_about_input.text().strip()
         cnt = self.group_count_spin.value()
         photo = self.photo_path_input.text().strip()
+        is_forum = self.group_type_combo.currentData() == "forum"
+        topic_title = self.topic_custom_input.text().strip() or str(self.topic_preset_combo.currentData() or "").strip()
 
         if not title:
             self.show_error("Введите название группы")
@@ -1044,9 +1086,16 @@ class MainWindow(QMainWindow):
                 for i in range(cnt):
                     await self.wait_groups_delay()
                     gname = title if cnt == 1 else f"{title} #{i + 1}"
-                    res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True))
+                    res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
                     channel = res.chats[0]
                     logs.append(f"Создана группа: {gname}")
+
+                    if is_forum and topic_title:
+                        await self.wait_groups_delay()
+                        messages_mod = import_module("telethon.tl.functions.messages")
+                        create_topic_request = getattr(messages_mod, "CreateForumTopicRequest")
+                        await client(create_topic_request(peer=channel, title=topic_title))
+                        logs.append(f"Создана тема в {gname}: {topic_title}")
 
                     if photo:
                         p = Path(photo)
