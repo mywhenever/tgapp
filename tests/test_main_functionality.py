@@ -105,6 +105,17 @@ def test_parse_contacts_success() -> None:
     assert contacts[0].phone == "+79990001122"
 
 
+def test_normalize_phone_adds_plus_when_missing() -> None:
+    assert MainWindow.normalize_phone("79990001122") == "+79990001122"
+    assert MainWindow.normalize_phone("+79990001122") == "+79990001122"
+
+
+def test_parse_contacts_auto_adds_plus_when_missing() -> None:
+    raw = "Иванов Иван Иванович 01.01.1990\nhttps://t.me/79990001122"
+    contacts = MainWindow.parse_contacts(raw)
+    assert contacts[0].phone == "+79990001122"
+
+
 def test_retry_async_succeeds_after_retries() -> None:
     state = {"calls": 0}
 
