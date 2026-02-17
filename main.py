@@ -5,7 +5,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtWidgets import (
@@ -34,6 +34,9 @@ from telethon.tl.functions.contacts import ImportContactsRequest
 from telethon.tl.types import InputChatUploadedPhoto, InputPhoneContact
 
 SETTINGS_FILE = Path("app_settings.json")
+
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.7
 
 
 @dataclass
@@ -151,6 +154,20 @@ class MainWindow(QMainWindow):
         self.btn_pick_photo = QPushButton("Выбрать фото")
         self.use_members_checkbox = QCheckBox("Добавлять участников")
         self.use_members_checkbox.setChecked(True)
+        self.group_use_contacts_checkbox = QCheckBox("Контакты")
+        self.group_use_contacts_checkbox.setChecked(True)
+        self.group_use_usernames_checkbox = QCheckBox("Юзернеймы/ссылки")
+        self.group_use_usernames_checkbox.setChecked(True)
+        self.group_use_ids_checkbox = QCheckBox("ID пользователей")
+        self.group_use_ids_checkbox.setChecked(False)
+        self.group_contacts_input = QPlainTextEdit()
+        self.group_contacts_input.setPlaceholderText(
+            "Иванов Иван Иванович 01.01.1990\nhttps://t.me/+79990001122\n\nПетров Петр 02.02.1992\nhttps://t.me/+79990001123"
+        )
+        self.group_usernames_input = QPlainTextEdit()
+        self.group_usernames_input.setPlaceholderText("@durov\ntelegram\nhttps://t.me/example_username")
+        self.group_user_ids_input = QPlainTextEdit()
+        self.group_user_ids_input.setPlaceholderText("123456789\n987654321")
         self.btn_create_with_members = QPushButton("Создать группы + участники")
         self.btn_create_without_members = QPushButton("Создать группы без участников")
 
@@ -199,6 +216,7 @@ class MainWindow(QMainWindow):
 
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_group_member_inputs()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -299,6 +317,15 @@ class MainWindow(QMainWindow):
         form.addRow("Фото", photo_row)
         form.addRow("Участники", self.use_members_checkbox)
 
+        member_types_row = QWidget()
+        member_types_l = QHBoxLayout(member_types_row)
+        member_types_l.setContentsMargins(0, 0, 0, 0)
+        member_types_l.addWidget(self.group_use_contacts_checkbox)
+        member_types_l.addWidget(self.group_use_usernames_checkbox)
+        member_types_l.addWidget(self.group_use_ids_checkbox)
+        member_types_l.addStretch(1)
+        form.addRow("Кого добавлять", member_types_row)
+
         delay_row = QWidget()
         delay_row_l = QHBoxLayout(delay_row)
         delay_row_l.setContentsMargins(0, 0, 0, 0)
@@ -310,6 +337,24 @@ class MainWindow(QMainWindow):
         form.addRow("Задержка действий", delay_row)
         form.addRow("", QLabel("Если рандом включён, пауза берётся случайно между от/до."))
         layout.addWidget(box)
+
+        group_contacts_box = QGroupBox("Контакты для групп")
+        group_contacts_l = QVBoxLayout(group_contacts_box)
+        self.group_contacts_input.setFixedHeight(130)
+        group_contacts_l.addWidget(self.group_contacts_input)
+        layout.addWidget(group_contacts_box)
+
+        group_refs_box = QGroupBox("Юзернеймы/ссылки для групп")
+        group_refs_l = QVBoxLayout(group_refs_box)
+        self.group_usernames_input.setFixedHeight(100)
+        group_refs_l.addWidget(self.group_usernames_input)
+        layout.addWidget(group_refs_box)
+
+        group_ids_box = QGroupBox("ID пользователей для групп")
+        group_ids_l = QVBoxLayout(group_ids_box)
+        self.group_user_ids_input.setFixedHeight(80)
+        group_ids_l.addWidget(self.group_user_ids_input)
+        layout.addWidget(group_ids_box)
 
         btn_row = QWidget()
         btn_l = QHBoxLayout(btn_row)
@@ -425,6 +470,17 @@ class MainWindow(QMainWindow):
         self.groups_delay_max_spin.valueChanged.connect(lambda _: self._on_delay_controls_changed())
         self.groups_random_delay_checkbox.toggled.connect(lambda _: self._on_delay_controls_changed())
 
+        self.group_use_contacts_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.group_use_usernames_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.group_use_ids_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.use_members_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
+        self.group_use_contacts_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
+        self.group_use_usernames_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
+        self.group_use_ids_checkbox.toggled.connect(lambda _: self._sync_group_member_inputs())
+        self.group_contacts_input.textChanged.connect(self._save_settings)
+        self.group_usernames_input.textChanged.connect(self._save_settings)
+        self.group_user_ids_input.textChanged.connect(self._save_settings)
+
     def _load_settings(self) -> None:
         data = {}
         if SETTINGS_FILE.exists():
@@ -462,12 +518,29 @@ class MainWindow(QMainWindow):
             self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
         )
 
+        group_members = data.get("group_members", {}) if isinstance(data, dict) else {}
+        self.group_use_contacts_checkbox.setChecked(
+            self._to_bool(group_members.get("use_contacts"), self.group_use_contacts_checkbox.isChecked())
+        )
+        self.group_use_usernames_checkbox.setChecked(
+            self._to_bool(group_members.get("use_usernames"), self.group_use_usernames_checkbox.isChecked())
+        )
+        self.group_use_ids_checkbox.setChecked(
+            self._to_bool(group_members.get("use_ids"), self.group_use_ids_checkbox.isChecked())
+        )
+        self.group_contacts_input.setPlainText(str(group_members.get("contacts", "")))
+        self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
+        self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
+
         self._refresh_accounts_combo()
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_group_member_inputs()
         self._loading_settings = False
 
     def _save_settings(self) -> None:
+        if self._loading_settings:
+            return
         payload = {
             "api": {
                 "api_id": self.api_id_input.text().strip(),
@@ -482,6 +555,14 @@ class MainWindow(QMainWindow):
                 "groups_min": self.groups_delay_min_spin.value(),
                 "groups_max": self.groups_delay_max_spin.value(),
                 "groups_random": self.groups_random_delay_checkbox.isChecked(),
+            },
+            "group_members": {
+                "use_contacts": self.group_use_contacts_checkbox.isChecked(),
+                "use_usernames": self.group_use_usernames_checkbox.isChecked(),
+                "use_ids": self.group_use_ids_checkbox.isChecked(),
+                "contacts": self.group_contacts_input.toPlainText(),
+                "usernames": self.group_usernames_input.toPlainText(),
+                "user_ids": self.group_user_ids_input.toPlainText(),
             },
         }
         SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -591,6 +672,36 @@ class MainWindow(QMainWindow):
             return random.randint(left, right)
         return left
 
+    @staticmethod
+    async def retry_async(
+        operation: Callable[[], Awaitable[object]],
+        *,
+        attempts: int = RETRY_ATTEMPTS,
+        base_delay: float = RETRY_BASE_DELAY,
+        retry_exceptions: tuple[type[BaseException], ...] = (Exception,),
+        on_retry: Optional[Callable[[int, BaseException], None]] = None,
+    ) -> object:
+        if attempts < 1:
+            raise ValueError("attempts должен быть >= 1")
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except retry_exceptions as exc:  # noqa: PERF203
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+                if on_retry:
+                    on_retry(attempt, exc)
+                delay = base_delay * attempt
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("retry_async завершился без результата")
+
     async def wait_contacts_delay(self) -> None:
         delay = self._get_delay(
             self.contacts_delay_min_spin.value(),
@@ -620,6 +731,16 @@ class MainWindow(QMainWindow):
 
         if max_spin.value() < min_spin.value():
             max_spin.setValue(min_spin.value())
+
+    def _sync_group_member_inputs(self) -> None:
+        use_members = self.use_members_checkbox.isChecked()
+        contacts_enabled = use_members and self.group_use_contacts_checkbox.isChecked()
+        refs_enabled = use_members and self.group_use_usernames_checkbox.isChecked()
+        ids_enabled = use_members and self.group_use_ids_checkbox.isChecked()
+
+        self.group_contacts_input.setEnabled(contacts_enabled)
+        self.group_usernames_input.setEnabled(refs_enabled)
+        self.group_user_ids_input.setEnabled(ids_enabled)
 
     def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
         self.set_busy(True)
@@ -713,6 +834,17 @@ class MainWindow(QMainWindow):
             ids.append(int(v))
         return ids
 
+    async def _get_entity_with_retry(self, client: TelegramClient, value: str | int):
+        async def _op():
+            return await client.get_entity(value)
+
+        return await self.retry_async(
+            _op,
+            attempts=RETRY_ATTEMPTS,
+            base_delay=RETRY_BASE_DELAY,
+            on_retry=lambda attempt, exc: self.log(f"retry get_entity({value}) attempt={attempt + 1}: {exc}"),
+        )
+
     def pick_photo(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.jpg *.jpeg *.png *.webp)")
         if p:
@@ -801,7 +933,7 @@ class MainWindow(QMainWindow):
                     for ref in refs:
                         await self.wait_contacts_delay()
                         try:
-                            await client.get_entity(ref)
+                            await self._get_entity_with_retry(client, ref)
                             ok += 1
                         except Exception:
                             fail += 1
@@ -812,7 +944,7 @@ class MainWindow(QMainWindow):
                     for uid in user_ids:
                         await self.wait_contacts_delay()
                         try:
-                            await client.get_entity(uid)
+                            await self._get_entity_with_retry(client, uid)
                             ok_ids += 1
                         except Exception:
                             fail_ids += 1
@@ -838,9 +970,34 @@ class MainWindow(QMainWindow):
 
         add_members = add_members and self.use_members_checkbox.isChecked()
         try:
-            contacts = self.parse_contacts(self.contacts_input.toPlainText()) if add_members else []
-            refs = self.parse_user_refs(self.usernames_input.toPlainText()) if add_members else []
-            user_ids = self.parse_user_ids(self.user_ids_input.toPlainText()) if add_members else []
+            contacts = (
+                self.parse_contacts(self.group_contacts_input.toPlainText())
+                if add_members and self.group_use_contacts_checkbox.isChecked() and self.group_contacts_input.toPlainText().strip()
+                else []
+            )
+            refs = (
+                self.parse_user_refs(self.group_usernames_input.toPlainText())
+                if add_members and self.group_use_usernames_checkbox.isChecked() and self.group_usernames_input.toPlainText().strip()
+                else []
+            )
+            user_ids = (
+                self.parse_user_ids(self.group_user_ids_input.toPlainText())
+                if add_members and self.group_use_ids_checkbox.isChecked() and self.group_user_ids_input.toPlainText().strip()
+                else []
+            )
+
+            selected_sources = [
+                self.group_use_contacts_checkbox.isChecked(),
+                self.group_use_usernames_checkbox.isChecked(),
+                self.group_use_ids_checkbox.isChecked(),
+            ]
+            if add_members and not any(selected_sources):
+                self.show_error("Выберите хотя бы один источник участников (Контакты, Юзернеймы/ссылки или ID)")
+                return
+
+            if add_members and not (contacts or refs or user_ids):
+                self.show_error("Для добавления участников заполните хотя бы одно выбранное поле в разделе «Группы»")
+                return
         except Exception as exc:  # noqa: BLE001
             self.show_error(str(exc))
             return
@@ -865,7 +1022,7 @@ class MainWindow(QMainWindow):
                     for ref in refs:
                         await self.wait_contacts_delay()
                         try:
-                            ent = await client.get_entity(ref)
+                            ent = await self._get_entity_with_retry(client, ref)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
                         except Exception:
@@ -874,7 +1031,7 @@ class MainWindow(QMainWindow):
                     for uid in user_ids:
                         await self.wait_contacts_delay()
                         try:
-                            ent = await client.get_entity(uid)
+                            ent = await self._get_entity_with_retry(client, uid)
                             if not getattr(ent, "bot", False):
                                 users_to_invite.append(ent)
                         except Exception:
