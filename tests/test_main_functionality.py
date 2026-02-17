@@ -100,8 +100,8 @@ def test_parse_contacts_success() -> None:
     raw = "Иванов Иван Иванович 01.01.1990\nhttps://t.me/+79990001122"
     contacts = MainWindow.parse_contacts(raw)
     assert len(contacts) == 1
-    assert contacts[0].first_name == "Иван Иванович"
-    assert contacts[0].last_name == "Иванов"
+    assert contacts[0].first_name == "Иванов Иван Иванович 01.01.1990"
+    assert contacts[0].last_name == ""
     assert contacts[0].phone == "+79990001122"
 
 

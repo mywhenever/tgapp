@@ -187,6 +187,7 @@ class MainWindow(QMainWindow):
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.setMaximumBlockCount(0)
 
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.TabPosition.South)
@@ -711,13 +712,21 @@ class MainWindow(QMainWindow):
         self.topic_preset_combo.setEnabled(is_forum)
         self.topic_custom_input.setEnabled(is_forum)
 
-    def run_task(self, fn: Callable[[], object], success_cb: Optional[Callable[[object], None]] = None) -> None:
-        self.set_busy(True)
+    def run_task(
+        self,
+        fn: Callable[[], object],
+        success_cb: Optional[Callable[[object], None]] = None,
+        *,
+        block_ui: bool = True,
+    ) -> None:
+        if block_ui:
+            self.set_busy(True)
         self.statusBar().showMessage("Выполняется операция, пожалуйста подождите...")
         task = AsyncTask(fn)
         task.signals.success.connect(lambda result: success_cb(result) if success_cb else None)
         task.signals.error.connect(self.show_error)
-        task.signals.done.connect(lambda: self.set_busy(False))
+        if block_ui:
+            task.signals.done.connect(lambda: self.set_busy(False))
         task.signals.done.connect(lambda: self.statusBar().showMessage("Готово"))
         self.thread_pool.start(task)
 
@@ -776,8 +785,8 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Нет ссылки для строки: {person_line}")
             link_line = lines[i + 1]
 
-            name_part = re.sub(r"\d{2}\.\d{2}\.\d{4}$", "", person_line).strip()
-            tokens = [t for t in name_part.split() if t]
+            full_name = re.sub(r"\s+", " ", person_line).strip()
+            tokens = [t for t in full_name.split() if t]
             if len(tokens) < 2:
                 raise ValueError(f"Не удалось распознать ФИО: {person_line}")
 
@@ -789,9 +798,7 @@ class MainWindow(QMainWindow):
             if not phone:
                 raise ValueError(f"Не удалось извлечь телефон: {link_line}")
 
-            first_name = " ".join(tokens[1:]) if len(tokens) > 1 else tokens[0]
-            last_name = tokens[0]
-            contacts.append(ContactData(first_name=first_name, last_name=last_name, phone=phone))
+            contacts.append(ContactData(first_name=full_name, last_name="", phone=phone))
             i += 2
         return contacts
 
@@ -974,7 +981,7 @@ class MainWindow(QMainWindow):
             return asyncio.run(_inner())
 
         self.log("Запущена обработка пользователей...")
-        self.run_task(job, success_cb=lambda result: self.log(str(result)))
+        self.run_task(job, success_cb=lambda result: self.log(str(result)), block_ui=False)
 
     def create_groups(self, add_members: bool) -> None:
         title = self.group_title_input.text().strip()
@@ -1068,7 +1075,7 @@ class MainWindow(QMainWindow):
 
                 for i in range(cnt):
                     await self.wait_groups_delay()
-                    gname = title if cnt == 1 else f"{title} #{i + 1}"
+                    gname = title
                     res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
                     channel = res.chats[0]
                     logs.append(f"Создана группа: {gname}")
@@ -1102,7 +1109,7 @@ class MainWindow(QMainWindow):
             return asyncio.run(_inner())
 
         self.log("Запущено создание групп...")
-        self.run_task(job, success_cb=lambda result: (self.log(str(result)), QMessageBox.information(self, "Готово", "Операция выполнена")))
+        self.run_task(job, success_cb=lambda result: self.log(str(result)))
 
 
 def main() -> None:
