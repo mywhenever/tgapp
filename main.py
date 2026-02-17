@@ -87,23 +87,14 @@ class MainWindow(QMainWindow):
         self.api_hash_input.setPlaceholderText("API HASH")
         self.btn_save_api = QPushButton("Сохранить API пару")
 
-        # Telegram accounts menu (no API pair inside)
-        self.accounts: list[dict[str, str]] = []
-        self.account_combo = QComboBox()
-        self.account_combo.setEditable(False)
-
-        self.account_name_input = QLineEdit()
-        self.account_name_input.setPlaceholderText("Например: Личный")
+        # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
         self.account_phone_input.setPlaceholderText("+79990001122")
         self.account_session_input = QLineEdit()
-        self.account_session_input.setPlaceholderText("session name, например: personal")
+        self.account_session_input.setPlaceholderText("session name, например: active_account")
 
-        self.btn_add_account = QPushButton("Добавить / обновить аккаунт")
-        self.btn_remove_account = QPushButton("Удалить аккаунт")
-        self.btn_save_accounts = QPushButton("Сохранить меню аккаунтов")
-        self.btn_use_account = QPushButton("Выбрать аккаунт")
-        self.btn_clear_account = QPushButton("Очистить форму")
+        self.btn_save_account = QPushButton("Сохранить текущий аккаунт")
+        self.btn_change_account = QPushButton("Сменить аккаунт")
 
         # login section
         self.phone_input = QLineEdit()
@@ -269,26 +260,16 @@ class MainWindow(QMainWindow):
         api_form.addRow("", self.btn_save_api)
         layout.addWidget(api_box)
 
-        menu_box = QGroupBox("Меню аккаунтов Telegram")
+        menu_box = QGroupBox("Текущий Telegram аккаунт")
         menu_form = QFormLayout(menu_box)
-        row = QWidget()
-        row_l = QHBoxLayout(row)
-        row_l.setContentsMargins(0, 0, 0, 0)
-        row_l.addWidget(self.account_combo)
-        row_l.addWidget(self.btn_use_account)
-        row_l.addWidget(self.btn_remove_account)
-        row_l.addWidget(self.btn_save_accounts)
-        menu_form.addRow("Выбор аккаунта", row)
-
-        menu_form.addRow("Название", self.account_name_input)
         menu_form.addRow("Телефон", self.account_phone_input)
         menu_form.addRow("Session", self.account_session_input)
 
         btn_row = QWidget()
         btn_row_l = QHBoxLayout(btn_row)
         btn_row_l.setContentsMargins(0, 0, 0, 0)
-        btn_row_l.addWidget(self.btn_add_account)
-        btn_row_l.addWidget(self.btn_clear_account)
+        btn_row_l.addWidget(self.btn_save_account)
+        btn_row_l.addWidget(self.btn_change_account)
         menu_form.addRow("", btn_row)
         layout.addWidget(menu_box)
 
@@ -445,12 +426,11 @@ class MainWindow(QMainWindow):
     def _bind_events(self) -> None:
         self.btn_save_api.clicked.connect(self.save_api_pair)
 
-        self.btn_add_account.clicked.connect(self.add_or_update_account)
-        self.btn_remove_account.clicked.connect(self.remove_account)
-        self.btn_save_accounts.clicked.connect(self.save_accounts)
-        self.btn_use_account.clicked.connect(self.apply_selected_account)
-        self.btn_clear_account.clicked.connect(self.clear_account_editor)
-        self.account_combo.currentIndexChanged.connect(self.on_account_selected)
+        self.btn_save_account.clicked.connect(self.save_account)
+        self.btn_change_account.clicked.connect(self.change_account)
+        self.account_phone_input.textChanged.connect(lambda text: self.phone_input.setText(text.strip()))
+        self.account_phone_input.textChanged.connect(self._save_settings)
+        self.account_session_input.textChanged.connect(self._save_settings)
 
         self.btn_request_code.clicked.connect(self.request_code)
         self.btn_sign_in.clicked.connect(self.sign_in)
@@ -513,16 +493,16 @@ class MainWindow(QMainWindow):
         self.api_id_input.setText(str(api.get("api_id", "")).strip())
         self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
 
-        accounts_raw = data.get("accounts", []) if isinstance(data, dict) else []
-        self.accounts = []
-        for a in accounts_raw:
-            if not isinstance(a, dict):
-                continue
-            name = str(a.get("name", "")).strip()
-            phone = str(a.get("phone", "")).strip()
-            session = str(a.get("session", "")).strip()
-            if phone and session:
-                self.accounts.append({"name": name or phone, "phone": phone, "session": session})
+        account = data.get("account", {}) if isinstance(data, dict) else {}
+        if not account and isinstance(data, dict):
+            # backward compatibility with old accounts list format
+            accounts_raw = data.get("accounts", [])
+            if isinstance(accounts_raw, list) and accounts_raw and isinstance(accounts_raw[0], dict):
+                account = accounts_raw[0]
+
+        self.account_phone_input.setText(str(account.get("phone", "")).strip())
+        self.account_session_input.setText(str(account.get("session", "")).strip())
+        self.phone_input.setText(self.account_phone_input.text().strip())
 
         delays = data.get("delays", {}) if isinstance(data, dict) else {}
         self._loading_settings = True
@@ -557,7 +537,6 @@ class MainWindow(QMainWindow):
         self._set_combo_by_data(self.topic_preset_combo, str(group_options.get("topic_preset", "")))
         self.topic_custom_input.setText(str(group_options.get("topic_custom", "")))
 
-        self._refresh_accounts_combo()
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         self._sync_forum_controls()
@@ -572,7 +551,10 @@ class MainWindow(QMainWindow):
                 "api_id": self.api_id_input.text().strip(),
                 "api_hash": self.api_hash_input.text().strip(),
             },
-            "accounts": self.accounts,
+            "account": {
+                "phone": self.account_phone_input.text().strip(),
+                "session": self.account_session_input.text().strip(),
+            },
             "delays": {
                 "auth": self.auth_delay_spin.value(),
                 "contacts_min": self.contacts_delay_min_spin.value(),
@@ -614,73 +596,26 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self.log("API ID + API HASH сохранены и будут использоваться после входа")
 
-    def _refresh_accounts_combo(self) -> None:
-        self.account_combo.blockSignals(True)
-        self.account_combo.clear()
-        for acc in self.accounts:
-            self.account_combo.addItem(f"{acc['name']} ({acc['phone']})", acc["session"])
-        self.account_combo.blockSignals(False)
-        if self.account_combo.count() > 0:
-            self.account_combo.setCurrentIndex(0)
-            self.on_account_selected()
-
-    def on_account_selected(self) -> None:
-        idx = self.account_combo.currentIndex()
-        if idx < 0 or idx >= len(self.accounts):
-            return
-        acc = self.accounts[idx]
-        self.account_name_input.setText(acc["name"])
-        self.account_phone_input.setText(acc["phone"])
-        self.account_session_input.setText(acc["session"])
-        self.phone_input.setText(acc["phone"])
-
-    def apply_selected_account(self) -> None:
-        self.on_account_selected()
-        idx = self.account_combo.currentIndex()
-        if idx >= 0:
-            self.log(f"Выбран аккаунт: {self.accounts[idx]['name']}")
-
-    def clear_account_editor(self) -> None:
-        self.account_name_input.clear()
-        self.account_phone_input.clear()
-        self.account_session_input.clear()
-
-    def add_or_update_account(self) -> None:
-        name = self.account_name_input.text().strip()
+    def save_account(self) -> None:
         phone = self.account_phone_input.text().strip()
         session = self.account_session_input.text().strip()
         if not phone or not session:
             self.show_error("Для аккаунта обязательны телефон и session")
             return
-        if not name:
-            name = phone
 
-        updated = False
-        for a in self.accounts:
-            if a["session"] == session:
-                a.update({"name": name, "phone": phone})
-                updated = True
-                break
-        if not updated:
-            self.accounts.append({"name": name, "phone": phone, "session": session})
-
-        self._refresh_accounts_combo()
+        self.phone_input.setText(phone)
         self._save_settings()
-        self.log(f"Аккаунт добавлен/обновлён: {name}")
+        self.log("Текущий аккаунт сохранён")
 
-    def remove_account(self) -> None:
-        idx = self.account_combo.currentIndex()
-        if idx < 0 or idx >= len(self.accounts):
-            return
-        name = self.accounts[idx]["name"]
-        self.accounts.pop(idx)
-        self._refresh_accounts_combo()
+    def change_account(self) -> None:
+        self.phone_code_hash = None
+        self.account_phone_input.clear()
+        self.account_session_input.clear()
+        self.phone_input.clear()
+        self.code_input.clear()
+        self.password_input.clear()
         self._save_settings()
-        self.log(f"Аккаунт удалён: {name}")
-
-    def save_accounts(self) -> None:
-        self._save_settings()
-        self.log(f"Меню аккаунтов сохранено ({len(self.accounts)} шт.)")
+        self.log("Режим смены аккаунта: введите новый телефон, session и снова выполните авторизацию")
 
     def _client_from_fields(self) -> TelegramClient:
         api_id = self.api_id_input.text().strip()
@@ -688,10 +623,9 @@ class MainWindow(QMainWindow):
         if not api_id.isdigit() or not api_hash:
             raise ValueError("Сначала заполните API ID + API HASH")
 
-        idx = self.account_combo.currentIndex()
-        if idx < 0 or idx >= len(self.accounts):
-            raise ValueError("Выберите аккаунт из меню аккаунтов")
-        session = self.accounts[idx]["session"]
+        session = self.account_session_input.text().strip()
+        if not session:
+            raise ValueError("Укажите session текущего аккаунта")
         return TelegramClient(session, int(api_id), api_hash)
 
     async def wait_auth_delay(self) -> None:
@@ -795,11 +729,8 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy: bool) -> None:
         for btn in [
             self.btn_save_api,
-            self.btn_add_account,
-            self.btn_remove_account,
-            self.btn_save_accounts,
-            self.btn_use_account,
-            self.btn_clear_account,
+            self.btn_save_account,
+            self.btn_change_account,
             self.btn_request_code,
             self.btn_sign_in,
             self.btn_pick_photo,
