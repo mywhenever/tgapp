@@ -59,6 +59,10 @@ class MainWindow(QMainWindow):
         self._task_queue: deque[tuple[Callable[[], object], Optional[Callable[[object], None]]]] = deque()
         self._task_in_progress = False
         self.phone_code_hash: Optional[str] = None
+        self._phone_code_target: str = ""
+        self._auth_client: Optional[TelegramClient] = None
+        self._auth_phone: str = ""
+        self._auth_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loading_settings = False
 
         # global app credentials (API ID + API HASH) used for login and all operations
@@ -585,6 +589,8 @@ class MainWindow(QMainWindow):
 
     def change_account(self) -> None:
         self.phone_code_hash = None
+        self._phone_code_target = ""
+        self._clear_auth_state()
         self.account_phone_input.clear()
         self.phone_input.clear()
         self.code_input.clear()
@@ -711,23 +717,23 @@ class MainWindow(QMainWindow):
         self._process_next_task()
 
     def _process_next_task(self) -> None:
-        if not self._task_queue:
-            self._task_in_progress = False
-            self.statusBar().showMessage("Готово")
+        if self._task_in_progress:
             return
 
         self._task_in_progress = True
-        self.statusBar().showMessage("Выполняется операция... Остальные действия будут обработаны по очереди")
-
-        fn, success_cb = self._task_queue.popleft()
         try:
-            result = fn()
-            if success_cb:
-                success_cb(result)
-        except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc), exc)
+            while self._task_queue:
+                self.statusBar().showMessage("Выполняется операция... Остальные действия будут обработаны по очереди")
+                fn, success_cb = self._task_queue.popleft()
+                try:
+                    result = fn()
+                    if success_cb:
+                        success_cb(result)
+                except Exception as exc:  # noqa: BLE001
+                    self.show_error(str(exc), exc)
         finally:
-            self._process_next_task()
+            self._task_in_progress = False
+            self.statusBar().showMessage("Готово")
 
     def set_busy(self, busy: bool) -> None:
         _ = busy
@@ -838,9 +844,36 @@ class MainWindow(QMainWindow):
     def _run_async_task(self, coro: Awaitable[object]) -> object:
         loop = asyncio.new_event_loop()
         try:
+            asyncio.set_event_loop(loop)
             return loop.run_until_complete(coro)
         finally:
+            asyncio.set_event_loop(None)
             loop.close()
+
+    def _run_on_auth_loop(self, coro: Awaitable[object]) -> object:
+        if self._auth_loop is None or self._auth_loop.is_closed():
+            self._auth_loop = asyncio.new_event_loop()
+
+        try:
+            asyncio.set_event_loop(self._auth_loop)
+            return self._auth_loop.run_until_complete(coro)
+        finally:
+            asyncio.set_event_loop(None)
+
+    def _clear_auth_state(self) -> None:
+        async def _disconnect() -> None:
+            if self._auth_client is not None:
+                await self._auth_client.disconnect()
+
+        try:
+            if self._auth_loop is not None and not self._auth_loop.is_closed():
+                self._run_on_auth_loop(_disconnect())
+        finally:
+            self._auth_client = None
+            self._auth_phone = ""
+            if self._auth_loop is not None and not self._auth_loop.is_closed():
+                self._auth_loop.close()
+            self._auth_loop = None
 
     def pick_photo(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.jpg *.jpeg *.png *.webp)")
@@ -857,60 +890,95 @@ class MainWindow(QMainWindow):
 
         def job() -> str:
             async def _inner() -> str:
-                self.log(f"[AUTH] Подготовка клиента для отправки кода. Телефон: {phone}")
                 client = self._client_from_fields()
                 try:
-                    self.log("[AUTH] Подключение к Telegram...")
                     await client.connect()
-                    self.log("[AUTH] Подключение успешно")
                     await self.wait_auth_delay()
-                    self.log("[AUTH] Запрос кода подтверждения...")
                     sent = await client.send_code_request(phone)
-                    self.log("[AUTH] Код запрошен")
+                    self._auth_client = client
+                    self._auth_phone = phone
                     return sent.phone_code_hash
-                finally:
-                    self.log("[AUTH] Отключение клиента")
+                except Exception:
                     await client.disconnect()
+                    raise
 
-            return self._run_async_task(_inner())
+            self._clear_auth_state()
+            return self._run_on_auth_loop(_inner())
 
-        self.log("[AUTH] Отправка кода...")
-        self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("[AUTH] Код отправлен")))
+        self.log(f"[AUTH] Отправка кода на {phone}...")
+
+        def _on_code_sent(phone_code_hash: object) -> None:
+            self.phone_code_hash = str(phone_code_hash)
+            self._phone_code_target = phone
+            self.log("[AUTH] Код отправлен. Введите код из Telegram и нажмите «Войти в аккаунт».")
+            self.statusBar().showMessage("Код отправлен. Введите код из Telegram")
+            self.code_input.setFocus()
+
+        self.run_task(job, success_cb=_on_code_sent)
 
     def sign_in(self) -> None:
         phone = self.normalize_phone(self.phone_input.text())
         code = self.code_input.text().strip()
         pwd = self.password_input.text().strip()
+        if not phone:
+            self.show_error("Введите телефон")
+            return
+        if not code:
+            self.show_error("Введите код из Telegram")
+            return
         if not self.phone_code_hash:
             self.show_error("Сначала отправьте код")
             return
+        if self._phone_code_target and self._phone_code_target != phone:
+            self.show_error("Телефон изменён после запроса кода. Запросите код заново для текущего номера")
+            return
 
         def job() -> str:
-            async def _inner() -> str:
+            async def _inner(client: TelegramClient) -> str:
                 self.log(f"[AUTH] Начало входа для {phone}")
+
+                await self.wait_auth_delay()
+                try:
+                    self.log("[AUTH] Выполняется sign_in по коду...")
+                    await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
+                    self.log("[AUTH] Вход по коду выполнен")
+                    result = "Успешный вход в аккаунт"
+                except SessionPasswordNeededError:
+                    self.log("[AUTH] Требуется 2FA пароль")
+                    if not pwd:
+                        raise ValueError("Нужен 2FA пароль")
+                    await client.sign_in(password=pwd)
+                    self.log("[AUTH] Вход по 2FA выполнен")
+                    result = "Успешный вход по 2FA"
+
+                self.log("[AUTH] Отключение клиента")
+                await client.disconnect()
+                return result
+
+            reusing_auth_client = self._auth_client is not None and self._auth_phone == phone
+            if reusing_auth_client and self._auth_client is not None:
+                try:
+                    return self._run_on_auth_loop(_inner(self._auth_client))
+                finally:
+                    self._clear_auth_state()
+                    self.phone_code_hash = None
+                    self._phone_code_target = ""
+
+            async def _fresh_login() -> str:
                 client = self._client_from_fields()
                 try:
                     self.log("[AUTH] Подключение к Telegram...")
                     await client.connect()
                     self.log("[AUTH] Подключение успешно")
-                    await self.wait_auth_delay()
-                    try:
-                        self.log("[AUTH] Выполняется sign_in по коду...")
-                        await client.sign_in(phone=phone, code=code, phone_code_hash=self.phone_code_hash)
-                        self.log("[AUTH] Вход по коду выполнен")
-                        return "Успешный вход в аккаунт"
-                    except SessionPasswordNeededError:
-                        self.log("[AUTH] Требуется 2FA пароль")
-                        if not pwd:
-                            raise ValueError("Нужен 2FA пароль")
-                        await client.sign_in(password=pwd)
-                        self.log("[AUTH] Вход по 2FA выполнен")
-                        return "Успешный вход по 2FA"
-                finally:
-                    self.log("[AUTH] Отключение клиента")
+                    return await _inner(client)
+                except Exception:
                     await client.disconnect()
+                    raise
 
-            return self._run_async_task(_inner())
+            result = self._run_async_task(_fresh_login())
+            self.phone_code_hash = None
+            self._phone_code_target = ""
+            return result
 
         self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
@@ -929,6 +997,8 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+            self._clear_auth_state()
+
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1033,6 +1103,8 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+            self._clear_auth_state()
+
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
