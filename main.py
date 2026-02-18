@@ -87,6 +87,22 @@ class MainWindow(QMainWindow):
         self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
         self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
 
+        # proxy
+        self.proxy_enabled_checkbox = QCheckBox("Использовать прокси")
+        self.proxy_type_combo = QComboBox()
+        self.proxy_type_combo.addItem("SOCKS5", "socks5")
+        self.proxy_type_combo.addItem("HTTP", "http")
+        self.proxy_host_input = QLineEdit()
+        self.proxy_host_input.setPlaceholderText("127.0.0.1")
+        self.proxy_port_spin = QSpinBox()
+        self.proxy_port_spin.setRange(1, 65535)
+        self.proxy_port_spin.setValue(1080)
+        self.proxy_username_input = QLineEdit()
+        self.proxy_username_input.setPlaceholderText("Логин (опционально)")
+        self.proxy_password_input = QLineEdit()
+        self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
+        self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+
         # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
         self.account_phone_input.setPlaceholderText("+79990001122")
@@ -272,13 +288,7 @@ class MainWindow(QMainWindow):
         api_form.addRow("Адрес прокси", proxy_addr_row)
         api_form.addRow("Логин прокси", self.proxy_username_input)
         api_form.addRow("Пароль прокси", self.proxy_password_input)
-
-        proxy_btn_row = QWidget()
-        proxy_btn_l = QHBoxLayout(proxy_btn_row)
-        proxy_btn_l.setContentsMargins(0, 0, 0, 0)
-        proxy_btn_l.addWidget(self.btn_check_proxy)
-        proxy_btn_l.addWidget(self.btn_save_api)
-        api_form.addRow("", proxy_btn_row)
+        api_form.addRow("", self.btn_save_api)
         layout.addWidget(api_box)
 
         menu_box = QGroupBox("Текущий Telegram аккаунт")
@@ -519,6 +529,30 @@ class MainWindow(QMainWindow):
             except Exception:
                 data = {}
 
+        api = data.get("api", {}) if isinstance(data, dict) else {}
+        self.api_id_input.setText(str(api.get("api_id", "")).strip())
+        self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
+
+        proxy = data.get("proxy", {}) if isinstance(data, dict) else {}
+        self.proxy_enabled_checkbox.setChecked(self._to_bool(proxy.get("enabled"), self.proxy_enabled_checkbox.isChecked()))
+        self._set_combo_by_data(self.proxy_type_combo, str(proxy.get("type", "socks5")))
+        self.proxy_host_input.setText(str(proxy.get("host", "")).strip())
+        self.proxy_port_spin.setValue(self._to_int(proxy.get("port"), self.proxy_port_spin.value()))
+        self.proxy_username_input.setText(str(proxy.get("username", "")))
+        self.proxy_password_input.setText(str(proxy.get("password", "")))
+
+        account = data.get("account", {}) if isinstance(data, dict) else {}
+        if not account and isinstance(data, dict):
+            # backward compatibility with old accounts list format
+            accounts_raw = data.get("accounts", [])
+            if isinstance(accounts_raw, list) and accounts_raw and isinstance(accounts_raw[0], dict):
+                account = accounts_raw[0]
+
+        account_phone = self.normalize_phone(str(account.get("phone", "")))
+        self.account_phone_input.setText(account_phone)
+        self.phone_input.setText(account_phone)
+
+        delays = data.get("delays", {}) if isinstance(data, dict) else {}
         self._loading_settings = True
         try:
             api = data.get("api", {}) if isinstance(data, dict) else {}
@@ -557,32 +591,12 @@ class MainWindow(QMainWindow):
                 self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
             )
 
-            group_members = data.get("group_members", {}) if isinstance(data, dict) else {}
-            self.group_use_contacts_checkbox.setChecked(
-                self._to_bool(group_members.get("use_contacts"), self.group_use_contacts_checkbox.isChecked())
-            )
-            self.group_use_usernames_checkbox.setChecked(
-                self._to_bool(group_members.get("use_usernames"), self.group_use_usernames_checkbox.isChecked())
-            )
-            self.group_use_ids_checkbox.setChecked(
-                self._to_bool(group_members.get("use_ids"), self.group_use_ids_checkbox.isChecked())
-            )
-            self.group_contacts_input.setPlainText(str(group_members.get("contacts", "")))
-            self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
-            self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
-
-            group_options = data.get("group_options", {}) if isinstance(data, dict) else {}
-            self._set_combo_by_data(self.group_type_combo, str(group_options.get("type", "normal")))
-            self._set_combo_by_data(self.topic_preset_combo, str(group_options.get("topic_preset", "")))
-            self.topic_custom_input.setText(str(group_options.get("topic_custom", "")))
-
-            self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
-            self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
-            self._sync_forum_controls()
-            self._sync_group_member_inputs()
-            self._sync_proxy_controls()
-        finally:
-            self._loading_settings = False
+        self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+        self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+        self._sync_forum_controls()
+        self._sync_group_member_inputs()
+        self._sync_proxy_controls()
+        self._loading_settings = False
 
     def _save_settings(self) -> None:
         if self._loading_settings:
