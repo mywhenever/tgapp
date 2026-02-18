@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self._task_queue: deque[tuple[Callable[[], object], Optional[Callable[[object], None]]]] = deque()
         self._task_in_progress = False
         self.phone_code_hash: Optional[str] = None
+        self._phone_code_target: str = ""
         self._auth_client: Optional[TelegramClient] = None
         self._auth_phone: str = ""
         self._auth_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -588,6 +589,8 @@ class MainWindow(QMainWindow):
 
     def change_account(self) -> None:
         self.phone_code_hash = None
+        self._phone_code_target = ""
+        self._clear_auth_state()
         self.account_phone_input.clear()
         self.phone_input.clear()
         self.code_input.clear()
@@ -906,6 +909,7 @@ class MainWindow(QMainWindow):
 
         def _on_code_sent(phone_code_hash: object) -> None:
             self.phone_code_hash = str(phone_code_hash)
+            self._phone_code_target = phone
             self.log("[AUTH] Код отправлен. Введите код из Telegram и нажмите «Войти в аккаунт».")
             self.statusBar().showMessage("Код отправлен. Введите код из Telegram")
             self.code_input.setFocus()
@@ -916,8 +920,17 @@ class MainWindow(QMainWindow):
         phone = self.normalize_phone(self.phone_input.text())
         code = self.code_input.text().strip()
         pwd = self.password_input.text().strip()
+        if not phone:
+            self.show_error("Введите телефон")
+            return
+        if not code:
+            self.show_error("Введите код из Telegram")
+            return
         if not self.phone_code_hash:
             self.show_error("Сначала отправьте код")
+            return
+        if self._phone_code_target and self._phone_code_target != phone:
+            self.show_error("Телефон изменён после запроса кода. Запросите код заново для текущего номера")
             return
 
         def job() -> str:
@@ -948,6 +961,8 @@ class MainWindow(QMainWindow):
                     return self._run_on_auth_loop(_inner(self._auth_client))
                 finally:
                     self._clear_auth_state()
+                    self.phone_code_hash = None
+                    self._phone_code_target = ""
 
             async def _fresh_login() -> str:
                 client = self._client_from_fields()
@@ -960,7 +975,10 @@ class MainWindow(QMainWindow):
                     await client.disconnect()
                     raise
 
-            return self._run_async_task(_fresh_login())
+            result = self._run_async_task(_fresh_login())
+            self.phone_code_hash = None
+            self._phone_code_target = ""
+            return result
 
         self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
@@ -979,6 +997,8 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+            self._clear_auth_state()
+
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1083,6 +1103,8 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+            self._clear_auth_state()
+
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
