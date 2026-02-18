@@ -3,14 +3,13 @@ import json
 import random
 import re
 import sys
-import threading
 import traceback
+from collections import deque
 from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -39,7 +38,6 @@ SETTINGS_FILE = Path("app_settings.json")
 
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 0.7
-TELEGRAM_SESSION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -49,30 +47,6 @@ class ContactData:
     phone: str
 
 
-
-
-class WorkerSignals(QObject):
-    success = Signal(object)
-    error = Signal(str, object)
-    done = Signal()
-
-
-class AsyncTask(QRunnable):
-    def __init__(self, fn: Callable[[], object]) -> None:
-        super().__init__()
-        self.fn = fn
-        self.signals = WorkerSignals()
-
-    def run(self) -> None:
-        try:
-            result = self.fn()
-            self.signals.success.emit(result)
-        except Exception as exc:  # noqa: BLE001
-            self.signals.error.emit(str(exc), exc)
-        finally:
-            self.signals.done.emit()
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -80,10 +54,10 @@ class MainWindow(QMainWindow):
         self.resize(1000, 840)
         self._apply_styles()
 
-        self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(1)
-        self._telegram_session_lock = TELEGRAM_SESSION_LOCK
-        self._queued_tasks = 0
+        # Очередь задач в UI-потоке.
+        # Не запускаем операции параллельно, чтобы не ловить блокировки sqlite-сессии Telethon.
+        self._task_queue: deque[tuple[Callable[[], object], Optional[Callable[[object], None]]]] = deque()
+        self._task_in_progress = False
         self.phone_code_hash: Optional[str] = None
         self._phone_code_target: str = ""
         self._loading_settings = False
@@ -729,25 +703,33 @@ class MainWindow(QMainWindow):
         block_ui: bool = True,
     ) -> None:
         _ = block_ui
-        self._queued_tasks += 1
-        if self._queued_tasks > 1:
-            self.statusBar().showMessage(f"Операция добавлена в очередь. В очереди: {self._queued_tasks - 1}")
-            self.log(f"[QUEUE] Операция добавлена в очередь. В очереди: {self._queued_tasks - 1}")
-        else:
-            self.statusBar().showMessage("Выполняется операция... Остальные действия будут обработаны по очереди")
+        self._task_queue.append((fn, success_cb))
+        if self._task_in_progress:
+            queued = len(self._task_queue)
+            self.statusBar().showMessage(f"Операция добавлена в очередь. В очереди: {queued}")
+            self.log(f"[QUEUE] Операция добавлена в очередь. В очереди: {queued}")
+            return
 
-        task = AsyncTask(fn)
-        task.signals.success.connect(lambda result: success_cb(result) if success_cb else None)
-        task.signals.error.connect(lambda text, exc: self.show_error(text, exc if isinstance(exc, Exception) else None))
-        task.signals.done.connect(self._on_task_done)
-        self.thread_pool.start(task)
+        self._process_next_task()
 
-    def _on_task_done(self) -> None:
-        self._queued_tasks = max(0, self._queued_tasks - 1)
-        if self._queued_tasks:
-            self.statusBar().showMessage(f"Выполняется операция... В очереди осталось: {self._queued_tasks - 1}")
-        else:
+    def _process_next_task(self) -> None:
+        if not self._task_queue:
+            self._task_in_progress = False
             self.statusBar().showMessage("Готово")
+            return
+
+        self._task_in_progress = True
+        self.statusBar().showMessage("Выполняется операция... Остальные действия будут обработаны по очереди")
+
+        fn, success_cb = self._task_queue.popleft()
+        try:
+            result = fn()
+            if success_cb:
+                success_cb(result)
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(str(exc), exc)
+        finally:
+            self._process_next_task()
 
     def set_busy(self, busy: bool) -> None:
         _ = busy
@@ -858,38 +840,9 @@ class MainWindow(QMainWindow):
     def _run_async_task(self, coro: Awaitable[object]) -> object:
         loop = asyncio.new_event_loop()
         try:
-            asyncio.set_event_loop(loop)
             return loop.run_until_complete(coro)
         finally:
-            asyncio.set_event_loop(None)
             loop.close()
-    def _run_serialized_telegram_job(self, action: Callable[[], object]) -> object:
-        with self._telegram_session_lock:
-            return action()
-
-    async def _invite_users_batched(self, client: TelegramClient, channel, users: list[object], logs: list[str]) -> int:
-        if not users:
-            return 0
-
-        batch_size = 20
-        invited = 0
-        for i in range(0, len(users), batch_size):
-            batch = users[i : i + batch_size]
-            await self.wait_groups_delay()
-            try:
-                await client(InviteToChannelRequest(channel=channel, users=batch))
-                invited += len(batch)
-                logs.append(f"Пакет приглашений {i // batch_size + 1}: +{len(batch)}")
-            except FloodWaitError as exc:
-                wait_seconds = int(getattr(exc, "seconds", 0) or 0)
-                logs.append(f"FloodWait при приглашении: ожидание {wait_seconds} сек")
-                if wait_seconds > 0:
-                    await asyncio.sleep(wait_seconds)
-                await client(InviteToChannelRequest(channel=channel, users=batch))
-                invited += len(batch)
-                logs.append(f"Пакет приглашений {i // batch_size + 1} успешно после ожидания")
-
-        return invited
 
     def pick_photo(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.jpg *.jpeg *.png *.webp)")
@@ -915,7 +868,7 @@ class MainWindow(QMainWindow):
                 finally:
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
+            return self._run_async_task(_inner())
 
         self.log(f"[AUTH] Отправка кода на {phone}...")
 
@@ -970,10 +923,7 @@ class MainWindow(QMainWindow):
                     self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
-            result = self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
-            self.phone_code_hash = None
-            self._phone_code_target = ""
-            return result
+            return self._run_async_task(_inner())
 
         self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
@@ -1045,7 +995,7 @@ class MainWindow(QMainWindow):
                 finally:
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
+            return self._run_async_task(_inner())
 
         self.log("Запущена обработка пользователей...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
@@ -1174,7 +1124,7 @@ class MainWindow(QMainWindow):
                 finally:
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
+            return self._run_async_task(_inner())
 
         self.log("Запущено создание групп...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
