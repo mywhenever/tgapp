@@ -2,14 +2,19 @@ import asyncio
 import json
 import random
 import re
+import subprocess
 import sys
+import threading
 import traceback
+import urllib.error
+import urllib.request
 from collections import deque
 from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -87,21 +92,18 @@ class MainWindow(QMainWindow):
         self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
         self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
 
-        # proxy
-        self.proxy_enabled_checkbox = QCheckBox("Использовать прокси")
-        self.proxy_type_combo = QComboBox()
-        self.proxy_type_combo.addItem("SOCKS5", "socks5")
-        self.proxy_type_combo.addItem("HTTP", "http")
-        self.proxy_host_input = QLineEdit()
-        self.proxy_host_input.setPlaceholderText("127.0.0.1")
-        self.proxy_port_spin = QSpinBox()
-        self.proxy_port_spin.setRange(1, 65535)
-        self.proxy_port_spin.setValue(1080)
-        self.proxy_username_input = QLineEdit()
-        self.proxy_username_input.setPlaceholderText("Логин (опционально)")
-        self.proxy_password_input = QLineEdit()
-        self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
-        self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        # update channel (safe actions only)
+        self.ip_update_input = QLineEdit()
+        self.ip_update_input.setPlaceholderText("127.0.0.1:8080")
+        self.update_poll_checkbox = QCheckBox("Фоновая проверка обновления")
+        self.update_poll_checkbox.setChecked(False)
+        self.update_ask_user_checkbox = QCheckBox("Всегда спрашивать перед применением")
+        self.update_ask_user_checkbox.setChecked(True)
+        self.btn_check_updates = QPushButton("Проверить обновления")
+        self._update_request_in_flight = False
+        self._update_poll_timer = QTimer(self)
+        self._update_poll_timer.setInterval(15000)
+        self._update_poll_timer.timeout.connect(self._poll_update_server_async)
 
         # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
@@ -288,6 +290,10 @@ class MainWindow(QMainWindow):
         api_form.addRow("Адрес прокси", proxy_addr_row)
         api_form.addRow("Логин прокси", self.proxy_username_input)
         api_form.addRow("Пароль прокси", self.proxy_password_input)
+        api_form.addRow("IP update", self.ip_update_input)
+        api_form.addRow("Автообновление", self.update_poll_checkbox)
+        api_form.addRow("Подтверждение", self.update_ask_user_checkbox)
+        api_form.addRow("", self.btn_check_updates)
         api_form.addRow("", self.btn_save_api)
         layout.addWidget(api_box)
 
@@ -470,6 +476,10 @@ class MainWindow(QMainWindow):
         self.proxy_port_spin.valueChanged.connect(lambda _: self._save_settings())
         self.proxy_username_input.textChanged.connect(self._save_settings)
         self.proxy_password_input.textChanged.connect(self._save_settings)
+        self.ip_update_input.textChanged.connect(self._save_settings)
+        self.update_poll_checkbox.toggled.connect(lambda _: self._on_update_polling_changed())
+        self.update_ask_user_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.btn_check_updates.clicked.connect(self._poll_update_server_async)
 
         self.btn_request_code.clicked.connect(self.request_code)
         self.btn_sign_in.clicked.connect(self.sign_in)
@@ -528,31 +538,6 @@ class MainWindow(QMainWindow):
                 data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
-
-        api = data.get("api", {}) if isinstance(data, dict) else {}
-        self.api_id_input.setText(str(api.get("api_id", "")).strip())
-        self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
-
-        proxy = data.get("proxy", {}) if isinstance(data, dict) else {}
-        self.proxy_enabled_checkbox.setChecked(self._to_bool(proxy.get("enabled"), self.proxy_enabled_checkbox.isChecked()))
-        self._set_combo_by_data(self.proxy_type_combo, str(proxy.get("type", "socks5")))
-        self.proxy_host_input.setText(str(proxy.get("host", "")).strip())
-        self.proxy_port_spin.setValue(self._to_int(proxy.get("port"), self.proxy_port_spin.value()))
-        self.proxy_username_input.setText(str(proxy.get("username", "")))
-        self.proxy_password_input.setText(str(proxy.get("password", "")))
-
-        account = data.get("account", {}) if isinstance(data, dict) else {}
-        if not account and isinstance(data, dict):
-            # backward compatibility with old accounts list format
-            accounts_raw = data.get("accounts", [])
-            if isinstance(accounts_raw, list) and accounts_raw and isinstance(accounts_raw[0], dict):
-                account = accounts_raw[0]
-
-        account_phone = self.normalize_phone(str(account.get("phone", "")))
-        self.account_phone_input.setText(account_phone)
-        self.phone_input.setText(account_phone)
-
-        delays = data.get("delays", {}) if isinstance(data, dict) else {}
         self._loading_settings = True
         try:
             api = data.get("api", {}) if isinstance(data, dict) else {}
@@ -566,6 +551,11 @@ class MainWindow(QMainWindow):
             self.proxy_port_spin.setValue(self._to_int(proxy.get("port"), self.proxy_port_spin.value()))
             self.proxy_username_input.setText(str(proxy.get("username", "")))
             self.proxy_password_input.setText(str(proxy.get("password", "")))
+
+            update_cfg = data.get("update", {}) if isinstance(data, dict) else {}
+            self.ip_update_input.setText(str(update_cfg.get("ip", "")).strip())
+            self.update_poll_checkbox.setChecked(self._to_bool(update_cfg.get("enabled"), self.update_poll_checkbox.isChecked()))
+            self.update_ask_user_checkbox.setChecked(self._to_bool(update_cfg.get("ask_user"), self.update_ask_user_checkbox.isChecked()))
 
             account = data.get("account", {}) if isinstance(data, dict) else {}
             if not account and isinstance(data, dict):
@@ -590,13 +580,37 @@ class MainWindow(QMainWindow):
             self.groups_random_delay_checkbox.setChecked(
                 self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
             )
+            group_members = data.get("group_members", {}) if isinstance(data, dict) else {}
+            self.group_use_contacts_checkbox.setChecked(
+                self._to_bool(group_members.get("use_contacts"), self.group_use_contacts_checkbox.isChecked())
+            )
+            self.group_use_usernames_checkbox.setChecked(
+                self._to_bool(group_members.get("use_usernames"), self.group_use_usernames_checkbox.isChecked())
+            )
+            self.group_use_ids_checkbox.setChecked(
+                self._to_bool(group_members.get("use_ids"), self.group_use_ids_checkbox.isChecked())
+            )
+            self.group_contacts_input.setPlainText(str(group_members.get("contacts", "")))
+            self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
+            self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
+
+            group_options = data.get("group_options", {}) if isinstance(data, dict) else {}
+            self._set_combo_by_data(self.group_type_combo, str(group_options.get("type", self.group_type_combo.currentData())))
+            self._set_combo_by_data(
+                self.topic_preset_combo,
+                str(group_options.get("topic_preset", self.topic_preset_combo.currentData())),
+            )
+            self.topic_custom_input.setText(str(group_options.get("topic_custom", "")).strip())
+        finally:
+            self._loading_settings = False
 
         self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         self._sync_forum_controls()
         self._sync_group_member_inputs()
         self._sync_proxy_controls()
-        self._loading_settings = False
+        if self.update_poll_checkbox.isChecked():
+            self._update_poll_timer.start()
 
     def _save_settings(self) -> None:
         if self._loading_settings:
@@ -613,6 +627,11 @@ class MainWindow(QMainWindow):
                 "port": self.proxy_port_spin.value(),
                 "username": self.proxy_username_input.text(),
                 "password": self.proxy_password_input.text(),
+            },
+            "update": {
+                "ip": self.ip_update_input.text().strip(),
+                "enabled": self.update_poll_checkbox.isChecked(),
+                "ask_user": self.update_ask_user_checkbox.isChecked(),
             },
             "account": {
                 "phone": self.account_phone_input.text().strip(),
@@ -995,6 +1014,77 @@ class MainWindow(QMainWindow):
             self.code_input.setFocus()
 
         self.run_task(job, success_cb=_on_code_sent)
+
+    def _on_update_polling_changed(self) -> None:
+        self._save_settings()
+        if self.update_poll_checkbox.isChecked():
+            self._update_poll_timer.start()
+            self._poll_update_server_async()
+        else:
+            self._update_poll_timer.stop()
+
+    def _poll_update_server_async(self) -> None:
+        if self._update_request_in_flight:
+            return
+        ip_update = self.ip_update_input.text().strip()
+        if not ip_update:
+            return
+        self._update_request_in_flight = True
+
+        def worker() -> None:
+            payload = None
+            try:
+                url = f"http://{ip_update}/update-command"
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                payload = {"action": "none", "error": str(exc)}
+
+            def finalize() -> None:
+                self._update_request_in_flight = False
+                self._handle_update_payload(payload)
+
+            QTimer.singleShot(0, finalize)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ask_user_for_remote_action(self, action: str) -> bool:
+        if not self.update_ask_user_checkbox.isChecked():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Подтверждение обновления",
+            f"Сервер обновления запросил действие: {action}. Выполнить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _run_local_updater(self) -> None:
+        updater_path = Path("updater.bat")
+        if not updater_path.exists():
+            self.log("Файл updater.bat не найден. Обновление пропущено")
+            return
+        subprocess.Popen(["cmd", "/c", str(updater_path)], shell=False)
+        self.log("Запущен updater.bat")
+
+    def _handle_update_payload(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        action = str(payload.get("action", "none")).strip().lower()
+        if action in {"", "none"}:
+            return
+        if action not in {"notify", "run_updater"}:
+            self.log(f"Отклонено небезопасное действие с сервера: {action}")
+            return
+        if not self._ask_user_for_remote_action(action):
+            self.log(f"Пользователь отклонил действие: {action}")
+            return
+        if action == "notify":
+            message = str(payload.get("message", "Доступно обновление"))
+            QMessageBox.information(self, "Обновление", message)
+            self.log(f"Сервер обновления: {message}")
+            return
+        self._run_local_updater()
 
     def check_proxy(self) -> None:
         if not self.proxy_enabled_checkbox.isChecked():
