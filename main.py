@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import threading
+import traceback
 from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest, InviteToChannelRequest
 from telethon.tl.functions.contacts import ImportContactsRequest
 from telethon.tl.types import InputChatUploadedPhoto, InputPhoneContact
@@ -49,9 +49,11 @@ class ContactData:
     phone: str
 
 
+
+
 class WorkerSignals(QObject):
     success = Signal(object)
-    error = Signal(str)
+    error = Signal(str, object)
     done = Signal()
 
 
@@ -66,7 +68,7 @@ class AsyncTask(QRunnable):
             result = self.fn()
             self.signals.success.emit(result)
         except Exception as exc:  # noqa: BLE001
-            self.signals.error.emit(str(exc))
+            self.signals.error.emit(str(exc), exc)
         finally:
             self.signals.done.emit()
 
@@ -79,12 +81,11 @@ class MainWindow(QMainWindow):
         self._apply_styles()
 
         self.thread_pool = QThreadPool.globalInstance()
-        # Telethon stores session data in SQLite.
-        # A single worker and a process-wide lock prevent concurrent writes
-        # that can trigger "database is locked" errors for the same session.
         self.thread_pool.setMaxThreadCount(1)
         self._telegram_session_lock = TELEGRAM_SESSION_LOCK
+        self._queued_tasks = 0
         self.phone_code_hash: Optional[str] = None
+        self._phone_code_target: str = ""
         self._loading_settings = False
 
         # global app credentials (API ID + API HASH) used for login and all operations
@@ -611,6 +612,7 @@ class MainWindow(QMainWindow):
 
     def change_account(self) -> None:
         self.phone_code_hash = None
+        self._phone_code_target = ""
         self.account_phone_input.clear()
         self.phone_input.clear()
         self.code_input.clear()
@@ -726,41 +728,38 @@ class MainWindow(QMainWindow):
         *,
         block_ui: bool = True,
     ) -> None:
-        if block_ui:
-            self.set_busy(True)
-        self.statusBar().showMessage("Выполняется операция, пожалуйста подождите...")
+        _ = block_ui
+        self._queued_tasks += 1
+        if self._queued_tasks > 1:
+            self.statusBar().showMessage(f"Операция добавлена в очередь. В очереди: {self._queued_tasks - 1}")
+            self.log(f"[QUEUE] Операция добавлена в очередь. В очереди: {self._queued_tasks - 1}")
+        else:
+            self.statusBar().showMessage("Выполняется операция... Остальные действия будут обработаны по очереди")
+
         task = AsyncTask(fn)
         task.signals.success.connect(lambda result: success_cb(result) if success_cb else None)
-        task.signals.error.connect(self.show_error)
-        if block_ui:
-            task.signals.done.connect(lambda: self.set_busy(False))
-        task.signals.done.connect(lambda: self.statusBar().showMessage("Готово"))
+        task.signals.error.connect(lambda text, exc: self.show_error(text, exc if isinstance(exc, Exception) else None))
+        task.signals.done.connect(self._on_task_done)
         self.thread_pool.start(task)
 
-    def _run_serialized_telegram_job(self, action: Callable[[], str]) -> str:
-        with self._telegram_session_lock:
-            return action()
+    def _on_task_done(self) -> None:
+        self._queued_tasks = max(0, self._queued_tasks - 1)
+        if self._queued_tasks:
+            self.statusBar().showMessage(f"Выполняется операция... В очереди осталось: {self._queued_tasks - 1}")
+        else:
+            self.statusBar().showMessage("Готово")
 
     def set_busy(self, busy: bool) -> None:
-        for btn in [
-            self.btn_save_api,
-            self.btn_save_account,
-            self.btn_change_account,
-            self.btn_request_code,
-            self.btn_sign_in,
-            self.btn_pick_photo,
-            self.btn_create_with_members,
-            self.btn_create_without_members,
-            self.btn_add_users_only,
-        ]:
-            btn.setEnabled(not busy)
+        _ = busy
 
     def log(self, text: str) -> None:
         self.log_output.appendPlainText(text)
 
-    def show_error(self, text: str) -> None:
+    def show_error(self, text: str, exc: Exception | None = None) -> None:
         self.log(f"[ОШИБКА] {text}")
-        QMessageBox.critical(self, "Ошибка", text)
+        print(f"[ОШИБКА] {text}", file=sys.stderr)
+        if exc is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     @staticmethod
     def normalize_phone(phone: str) -> str:
@@ -855,6 +854,43 @@ class MainWindow(QMainWindow):
             on_retry=lambda attempt, exc: self.log(f"retry get_entity({value}) attempt={attempt + 1}: {exc}"),
         )
 
+
+    def _run_async_task(self, coro: Awaitable[object]) -> object:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+    def _run_serialized_telegram_job(self, action: Callable[[], object]) -> object:
+        with self._telegram_session_lock:
+            return action()
+
+    async def _invite_users_batched(self, client: TelegramClient, channel, users: list[object], logs: list[str]) -> int:
+        if not users:
+            return 0
+
+        batch_size = 20
+        invited = 0
+        for i in range(0, len(users), batch_size):
+            batch = users[i : i + batch_size]
+            await self.wait_groups_delay()
+            try:
+                await client(InviteToChannelRequest(channel=channel, users=batch))
+                invited += len(batch)
+                logs.append(f"Пакет приглашений {i // batch_size + 1}: +{len(batch)}")
+            except FloodWaitError as exc:
+                wait_seconds = int(getattr(exc, "seconds", 0) or 0)
+                logs.append(f"FloodWait при приглашении: ожидание {wait_seconds} сек")
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                await client(InviteToChannelRequest(channel=channel, users=batch))
+                invited += len(batch)
+                logs.append(f"Пакет приглашений {i // batch_size + 1} успешно после ожидания")
+
+        return invited
+
     def pick_photo(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.jpg *.jpeg *.png *.webp)")
         if p:
@@ -870,32 +906,43 @@ class MainWindow(QMainWindow):
 
         def job() -> str:
             async def _inner() -> str:
-                self.log(f"[AUTH] Подготовка клиента для отправки кода. Телефон: {phone}")
                 client = self._client_from_fields()
                 try:
-                    self.log("[AUTH] Подключение к Telegram...")
                     await client.connect()
-                    self.log("[AUTH] Подключение успешно")
                     await self.wait_auth_delay()
-                    self.log("[AUTH] Запрос кода подтверждения...")
                     sent = await client.send_code_request(phone)
-                    self.log("[AUTH] Код запрошен")
                     return sent.phone_code_hash
                 finally:
-                    self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
+            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
 
-        self.log("[AUTH] Отправка кода...")
-        self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("[AUTH] Код отправлен")))
+        self.log(f"[AUTH] Отправка кода на {phone}...")
+
+        def _on_code_sent(phone_code_hash: object) -> None:
+            self.phone_code_hash = str(phone_code_hash)
+            self._phone_code_target = phone
+            self.log("[AUTH] Код отправлен. Введите код из Telegram и нажмите «Войти в аккаунт».")
+            self.statusBar().showMessage("Код отправлен. Введите код из Telegram")
+            self.code_input.setFocus()
+
+        self.run_task(job, success_cb=_on_code_sent)
 
     def sign_in(self) -> None:
         phone = self.normalize_phone(self.phone_input.text())
         code = self.code_input.text().strip()
         pwd = self.password_input.text().strip()
+        if not phone:
+            self.show_error("Введите телефон")
+            return
+        if not code:
+            self.show_error("Введите код из Telegram")
+            return
         if not self.phone_code_hash:
             self.show_error("Сначала отправьте код")
+            return
+        if self._phone_code_target and self._phone_code_target != phone:
+            self.show_error("Телефон изменён после запроса кода. Запросите код заново для текущего номера")
             return
 
         def job() -> str:
@@ -923,7 +970,10 @@ class MainWindow(QMainWindow):
                     self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
+            result = self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
+            self.phone_code_hash = None
+            self._phone_code_target = ""
+            return result
 
         self.log("[AUTH] Выполняется вход...")
         self.run_task(job, success_cb=lambda msg: self.log(str(msg)))
@@ -938,10 +988,11 @@ class MainWindow(QMainWindow):
             refs = self.parse_user_refs(refs_raw) if refs_raw.strip() else []
             user_ids = self.parse_user_ids(ids_raw) if ids_raw.strip() else []
         except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc))
+            self.show_error(str(exc), exc)
             return
 
         def job() -> str:
+    
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -994,10 +1045,10 @@ class MainWindow(QMainWindow):
                 finally:
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
+            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
 
         self.log("Запущена обработка пользователей...")
-        self.run_task(job, success_cb=lambda result: self.log(str(result)), block_ui=False)
+        self.run_task(job, success_cb=lambda result: self.log(str(result)))
 
     def create_groups(self, add_members: bool) -> None:
         title = self.group_title_input.text().strip()
@@ -1042,10 +1093,11 @@ class MainWindow(QMainWindow):
                 self.show_error("Для добавления участников заполните хотя бы одно выбранное поле в разделе «Группы»")
                 return
         except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc))
+            self.show_error(str(exc), exc)
             return
 
         def job() -> str:
+    
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1112,9 +1164,8 @@ class MainWindow(QMainWindow):
                             await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
 
                         if add_members and users_to_invite:
-                            await self.wait_groups_delay()
-                            await client(InviteToChannelRequest(channel=channel, users=users_to_invite))
-                            logs.append(f"Добавлено участников в {gname}: {len(users_to_invite)}")
+                            invited_count = await self._invite_users_batched(client, channel, users_to_invite, logs)
+                            logs.append(f"Добавлено участников в {gname}: {invited_count}")
 
                     if not add_members:
                         logs.append("Группы созданы без участников")
@@ -1123,7 +1174,7 @@ class MainWindow(QMainWindow):
                 finally:
                     await client.disconnect()
 
-            return self._run_serialized_telegram_job(lambda: asyncio.run(_inner()))
+            return self._run_serialized_telegram_job(lambda: self._run_async_task(_inner()))
 
         self.log("Запущено создание групп...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
