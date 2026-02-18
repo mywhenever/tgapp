@@ -169,3 +169,271 @@ def test_retry_async_validates_attempts() -> None:
 
 def test_session_from_phone_uses_digits_only() -> None:
     assert MainWindow.session_from_phone("+7 (999) 000-11-22") == "tg_session_79990001122"
+
+
+def test_sync_group_member_inputs_keeps_id_field_editable_when_members_enabled() -> None:
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    class _Input:
+        def __init__(self):
+            self.enabled = None
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    fake_window = types.SimpleNamespace(
+        use_members_checkbox=_Toggle(True),
+        group_use_contacts_checkbox=_Toggle(False),
+        group_use_usernames_checkbox=_Toggle(False),
+        group_use_ids_checkbox=_Toggle(False),
+        group_contacts_input=_Input(),
+        group_usernames_input=_Input(),
+        group_user_ids_input=_Input(),
+    )
+
+    MainWindow._sync_group_member_inputs(fake_window)
+
+    assert fake_window.group_contacts_input.enabled is True
+    assert fake_window.group_usernames_input.enabled is True
+    assert fake_window.group_user_ids_input.enabled is True
+
+
+def test_build_proxy_config_returns_none_when_disabled() -> None:
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    fake_window = types.SimpleNamespace(proxy_enabled_checkbox=_Toggle(False))
+
+    assert MainWindow._build_proxy_config(fake_window) is None
+
+
+def test_build_proxy_config_builds_tuple_for_socks5(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    class _Line:
+        def __init__(self, value: str):
+            self._value = value
+
+        def text(self) -> str:
+            return self._value
+
+    class _Combo:
+        def __init__(self, value: str):
+            self._value = value
+
+        def currentData(self) -> str:
+            return self._value
+
+    class _Port:
+        def __init__(self, value: int):
+            self._value = value
+
+        def value(self) -> int:
+            return self._value
+
+    socks_stub = types.SimpleNamespace(SOCKS5=123, HTTP=456)
+    monkeypatch.setattr('main.import_module', lambda name: socks_stub if name == 'socks' else None)
+
+    fake_window = types.SimpleNamespace(
+        proxy_enabled_checkbox=_Toggle(True),
+        proxy_host_input=_Line('127.0.0.1'),
+        proxy_type_combo=_Combo('socks5'),
+        proxy_port_spin=_Port(1080),
+        proxy_username_input=_Line('user'),
+        proxy_password_input=_Line('pass'),
+    )
+
+    proxy = MainWindow._build_proxy_config(fake_window)
+    assert proxy == (123, '127.0.0.1', 1080, True, 'user', 'pass')
+
+
+def test_build_proxy_config_requires_host_when_enabled() -> None:
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    class _Line:
+        def __init__(self, value: str):
+            self._value = value
+
+        def text(self) -> str:
+            return self._value
+
+    fake_window = types.SimpleNamespace(
+        proxy_enabled_checkbox=_Toggle(True),
+        proxy_host_input=_Line('   '),
+    )
+
+    with pytest.raises(ValueError, match='хост прокси'):
+        MainWindow._build_proxy_config(fake_window)
+
+
+def test_build_proxy_config_uses_http_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    class _Line:
+        def __init__(self, value: str):
+            self._value = value
+
+        def text(self) -> str:
+            return self._value
+
+    class _Combo:
+        def __init__(self, value: str):
+            self._value = value
+
+        def currentData(self) -> str:
+            return self._value
+
+    class _Port:
+        def __init__(self, value: int):
+            self._value = value
+
+        def value(self) -> int:
+            return self._value
+
+    socks_stub = types.SimpleNamespace(SOCKS5=123, HTTP=456)
+    monkeypatch.setattr('main.import_module', lambda name: socks_stub if name == 'socks' else None)
+
+    fake_window = types.SimpleNamespace(
+        proxy_enabled_checkbox=_Toggle(True),
+        proxy_host_input=_Line('10.0.0.2'),
+        proxy_type_combo=_Combo('http'),
+        proxy_port_spin=_Port(3128),
+        proxy_username_input=_Line(''),
+        proxy_password_input=_Line(''),
+    )
+
+    proxy = MainWindow._build_proxy_config(fake_window)
+    assert proxy == (456, '10.0.0.2', 3128, True, None, None)
+
+
+def test_check_proxy_requires_enabled_flag() -> None:
+    errors: list[str] = []
+
+    class _Toggle:
+        def __init__(self, checked: bool):
+            self._checked = checked
+
+        def isChecked(self) -> bool:
+            return self._checked
+
+    fake_window = types.SimpleNamespace(
+        proxy_enabled_checkbox=_Toggle(False),
+        show_error=lambda msg, exc=None: errors.append(msg),
+    )
+
+    MainWindow.check_proxy(fake_window)
+
+    assert errors == ['Сначала включите прокси']
+
+
+def test_sync_forum_controls_disables_topic_inputs_for_basic_group() -> None:
+    class _Combo:
+        def __init__(self, data: str):
+            self._data = data
+
+        def currentData(self) -> str:
+            return self._data
+
+    class _Input:
+        def __init__(self):
+            self.enabled = None
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    fake_window = types.SimpleNamespace(
+        group_type_combo=_Combo('basic'),
+        topic_preset_combo=_Input(),
+        topic_custom_input=_Input(),
+    )
+
+    MainWindow._sync_forum_controls(fake_window)
+
+    assert fake_window.topic_preset_combo.enabled is False
+    assert fake_window.topic_custom_input.enabled is False
+
+
+def test_retry_failed_groups_shows_error_without_failed_items() -> None:
+    errors: list[str] = []
+
+    fake_window = types.SimpleNamespace(
+        _last_failed_group_indices=[],
+        _last_failed_add_members=False,
+        show_error=lambda msg, exc=None: errors.append(msg),
+    )
+
+    MainWindow.retry_failed_groups(fake_window)
+
+    assert errors == ['Нет неуспешных операций для повтора']
+
+
+def test_group_summary_dialog_retries_failed_items_on_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    retried = {"called": False}
+
+    class _MsgBox:
+        Yes = 1
+        No = 2
+
+        @staticmethod
+        def question(*args, **kwargs):
+            return _MsgBox.Yes
+
+    monkeypatch.setattr('main.QMessageBox', _MsgBox)
+
+    fake_window = types.SimpleNamespace(
+        _last_failed_group_indices=[0, 2],
+        log=lambda text: None,
+        retry_failed_groups=lambda: retried.__setitem__('called', True),
+    )
+
+    MainWindow._on_group_operation_finished(fake_window, {"log": "ok", "summary": "sum"})
+
+    assert retried["called"] is True
+
+
+def test_group_summary_dialog_does_not_retry_on_no(monkeypatch: pytest.MonkeyPatch) -> None:
+    retried = {"called": False}
+
+    class _MsgBox:
+        Yes = 1
+        No = 2
+
+        @staticmethod
+        def question(*args, **kwargs):
+            return _MsgBox.No
+
+    monkeypatch.setattr('main.QMessageBox', _MsgBox)
+
+    fake_window = types.SimpleNamespace(
+        _last_failed_group_indices=[1],
+        log=lambda text: None,
+        retry_failed_groups=lambda: retried.__setitem__('called', True),
+    )
+
+    MainWindow._on_group_operation_finished(fake_window, {"log": "ok", "summary": "sum"})
+
+    assert retried["called"] is False

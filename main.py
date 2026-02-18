@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
@@ -68,6 +69,23 @@ class MainWindow(QMainWindow):
         self.api_hash_input = QLineEdit()
         self.api_hash_input.setPlaceholderText("API HASH")
         self.btn_save_api = QPushButton("Сохранить API пару")
+        self.btn_check_proxy = QPushButton("Проверить прокси")
+
+        # proxy
+        self.proxy_enabled_checkbox = QCheckBox("Использовать прокси")
+        self.proxy_type_combo = QComboBox()
+        self.proxy_type_combo.addItem("SOCKS5", "socks5")
+        self.proxy_type_combo.addItem("HTTP", "http")
+        self.proxy_host_input = QLineEdit()
+        self.proxy_host_input.setPlaceholderText("127.0.0.1")
+        self.proxy_port_spin = QSpinBox()
+        self.proxy_port_spin.setRange(1, 65535)
+        self.proxy_port_spin.setValue(1080)
+        self.proxy_username_input = QLineEdit()
+        self.proxy_username_input.setPlaceholderText("Логин (опционально)")
+        self.proxy_password_input = QLineEdit()
+        self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
+        self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
 
         # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
@@ -121,6 +139,7 @@ class MainWindow(QMainWindow):
         self.group_count_spin.setRange(1, 100)
         self.group_count_spin.setValue(1)
         self.group_type_combo = QComboBox()
+        self.group_type_combo.addItem("Обычная группа", "basic")
         self.group_type_combo.addItem("Обычная супергруппа", "normal")
         self.group_type_combo.addItem("Группа с темами (форум)", "forum")
         self.topic_preset_combo = QComboBox()
@@ -152,6 +171,10 @@ class MainWindow(QMainWindow):
         self.group_user_ids_input.setPlaceholderText("123456789\n987654321")
         self.btn_create_with_members = QPushButton("Создать группы + участники")
         self.btn_create_without_members = QPushButton("Создать группы без участников")
+        self.btn_retry_failed_groups = QPushButton("Повторить неуспешные")
+        self.btn_retry_failed_groups.setEnabled(False)
+        self._last_failed_group_indices: list[int] = []
+        self._last_failed_add_members = False
 
         # contacts
         self.contacts_input = QPlainTextEdit()
@@ -237,7 +260,25 @@ class MainWindow(QMainWindow):
         api_form = QFormLayout(api_box)
         api_form.addRow("API ID", self.api_id_input)
         api_form.addRow("API HASH", self.api_hash_input)
-        api_form.addRow("", self.btn_save_api)
+        api_form.addRow("Прокси", self.proxy_enabled_checkbox)
+
+        proxy_addr_row = QWidget()
+        proxy_addr_l = QHBoxLayout(proxy_addr_row)
+        proxy_addr_l.setContentsMargins(0, 0, 0, 0)
+        proxy_addr_l.addWidget(self.proxy_type_combo)
+        proxy_addr_l.addWidget(self.proxy_host_input)
+        proxy_addr_l.addWidget(QLabel(":"))
+        proxy_addr_l.addWidget(self.proxy_port_spin)
+        api_form.addRow("Адрес прокси", proxy_addr_row)
+        api_form.addRow("Логин прокси", self.proxy_username_input)
+        api_form.addRow("Пароль прокси", self.proxy_password_input)
+
+        proxy_btn_row = QWidget()
+        proxy_btn_l = QHBoxLayout(proxy_btn_row)
+        proxy_btn_l.setContentsMargins(0, 0, 0, 0)
+        proxy_btn_l.addWidget(self.btn_check_proxy)
+        proxy_btn_l.addWidget(self.btn_save_api)
+        api_form.addRow("", proxy_btn_row)
         layout.addWidget(api_box)
 
         menu_box = QGroupBox("Текущий Telegram аккаунт")
@@ -337,6 +378,7 @@ class MainWindow(QMainWindow):
         btn_l.setContentsMargins(0, 0, 0, 0)
         btn_l.addWidget(self.btn_create_with_members)
         btn_l.addWidget(self.btn_create_without_members)
+        btn_l.addWidget(self.btn_retry_failed_groups)
         layout.addWidget(btn_row)
         layout.addStretch(1)
 
@@ -404,17 +446,27 @@ class MainWindow(QMainWindow):
 
     def _bind_events(self) -> None:
         self.btn_save_api.clicked.connect(self.save_api_pair)
+        self.btn_check_proxy.clicked.connect(self.check_proxy)
 
         self.btn_save_account.clicked.connect(self.save_account)
         self.btn_change_account.clicked.connect(self.change_account)
         self.account_phone_input.textChanged.connect(lambda text: self.phone_input.setText(self.normalize_phone(text)))
         self.account_phone_input.textChanged.connect(self._save_settings)
 
+        self.proxy_enabled_checkbox.toggled.connect(lambda _: self._sync_proxy_controls())
+        self.proxy_enabled_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.proxy_type_combo.currentIndexChanged.connect(lambda _: self._save_settings())
+        self.proxy_host_input.textChanged.connect(self._save_settings)
+        self.proxy_port_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.proxy_username_input.textChanged.connect(self._save_settings)
+        self.proxy_password_input.textChanged.connect(self._save_settings)
+
         self.btn_request_code.clicked.connect(self.request_code)
         self.btn_sign_in.clicked.connect(self.sign_in)
         self.btn_pick_photo.clicked.connect(self.pick_photo)
         self.btn_create_with_members.clicked.connect(lambda: self.create_groups(add_members=True))
         self.btn_create_without_members.clicked.connect(lambda: self.create_groups(add_members=False))
+        self.btn_retry_failed_groups.clicked.connect(self.retry_failed_groups)
         self.btn_add_users_only.clicked.connect(self.add_users_without_groups)
 
         self.contacts_random_delay_checkbox.toggled.connect(
@@ -467,59 +519,70 @@ class MainWindow(QMainWindow):
             except Exception:
                 data = {}
 
-        api = data.get("api", {}) if isinstance(data, dict) else {}
-        self.api_id_input.setText(str(api.get("api_id", "")).strip())
-        self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
-
-        account = data.get("account", {}) if isinstance(data, dict) else {}
-        if not account and isinstance(data, dict):
-            # backward compatibility with old accounts list format
-            accounts_raw = data.get("accounts", [])
-            if isinstance(accounts_raw, list) and accounts_raw and isinstance(accounts_raw[0], dict):
-                account = accounts_raw[0]
-
-        account_phone = self.normalize_phone(str(account.get("phone", "")))
-        self.account_phone_input.setText(account_phone)
-        self.phone_input.setText(account_phone)
-
-        delays = data.get("delays", {}) if isinstance(data, dict) else {}
         self._loading_settings = True
-        self.auth_delay_spin.setValue(self._to_int(delays.get("auth"), self.auth_delay_spin.value()))
-        self.contacts_delay_min_spin.setValue(self._to_int(delays.get("contacts_min"), self.contacts_delay_min_spin.value()))
-        self.contacts_delay_max_spin.setValue(self._to_int(delays.get("contacts_max"), self.contacts_delay_max_spin.value()))
-        self.contacts_random_delay_checkbox.setChecked(
-            self._to_bool(delays.get("contacts_random"), self.contacts_random_delay_checkbox.isChecked())
-        )
-        self.groups_delay_min_spin.setValue(self._to_int(delays.get("groups_min"), self.groups_delay_min_spin.value()))
-        self.groups_delay_max_spin.setValue(self._to_int(delays.get("groups_max"), self.groups_delay_max_spin.value()))
-        self.groups_random_delay_checkbox.setChecked(
-            self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
-        )
+        try:
+            api = data.get("api", {}) if isinstance(data, dict) else {}
+            self.api_id_input.setText(str(api.get("api_id", "")).strip())
+            self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
 
-        group_members = data.get("group_members", {}) if isinstance(data, dict) else {}
-        self.group_use_contacts_checkbox.setChecked(
-            self._to_bool(group_members.get("use_contacts"), self.group_use_contacts_checkbox.isChecked())
-        )
-        self.group_use_usernames_checkbox.setChecked(
-            self._to_bool(group_members.get("use_usernames"), self.group_use_usernames_checkbox.isChecked())
-        )
-        self.group_use_ids_checkbox.setChecked(
-            self._to_bool(group_members.get("use_ids"), self.group_use_ids_checkbox.isChecked())
-        )
-        self.group_contacts_input.setPlainText(str(group_members.get("contacts", "")))
-        self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
-        self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
+            proxy = data.get("proxy", {}) if isinstance(data, dict) else {}
+            self.proxy_enabled_checkbox.setChecked(self._to_bool(proxy.get("enabled"), self.proxy_enabled_checkbox.isChecked()))
+            self._set_combo_by_data(self.proxy_type_combo, str(proxy.get("type", "socks5")))
+            self.proxy_host_input.setText(str(proxy.get("host", "")).strip())
+            self.proxy_port_spin.setValue(self._to_int(proxy.get("port"), self.proxy_port_spin.value()))
+            self.proxy_username_input.setText(str(proxy.get("username", "")))
+            self.proxy_password_input.setText(str(proxy.get("password", "")))
 
-        group_options = data.get("group_options", {}) if isinstance(data, dict) else {}
-        self._set_combo_by_data(self.group_type_combo, str(group_options.get("type", "normal")))
-        self._set_combo_by_data(self.topic_preset_combo, str(group_options.get("topic_preset", "")))
-        self.topic_custom_input.setText(str(group_options.get("topic_custom", "")))
+            account = data.get("account", {}) if isinstance(data, dict) else {}
+            if not account and isinstance(data, dict):
+                # backward compatibility with old accounts list format
+                accounts_raw = data.get("accounts", [])
+                if isinstance(accounts_raw, list) and accounts_raw and isinstance(accounts_raw[0], dict):
+                    account = accounts_raw[0]
 
-        self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
-        self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
-        self._sync_forum_controls()
-        self._sync_group_member_inputs()
-        self._loading_settings = False
+            account_phone = self.normalize_phone(str(account.get("phone", "")))
+            self.account_phone_input.setText(account_phone)
+            self.phone_input.setText(account_phone)
+
+            delays = data.get("delays", {}) if isinstance(data, dict) else {}
+            self.auth_delay_spin.setValue(self._to_int(delays.get("auth"), self.auth_delay_spin.value()))
+            self.contacts_delay_min_spin.setValue(self._to_int(delays.get("contacts_min"), self.contacts_delay_min_spin.value()))
+            self.contacts_delay_max_spin.setValue(self._to_int(delays.get("contacts_max"), self.contacts_delay_max_spin.value()))
+            self.contacts_random_delay_checkbox.setChecked(
+                self._to_bool(delays.get("contacts_random"), self.contacts_random_delay_checkbox.isChecked())
+            )
+            self.groups_delay_min_spin.setValue(self._to_int(delays.get("groups_min"), self.groups_delay_min_spin.value()))
+            self.groups_delay_max_spin.setValue(self._to_int(delays.get("groups_max"), self.groups_delay_max_spin.value()))
+            self.groups_random_delay_checkbox.setChecked(
+                self._to_bool(delays.get("groups_random"), self.groups_random_delay_checkbox.isChecked())
+            )
+
+            group_members = data.get("group_members", {}) if isinstance(data, dict) else {}
+            self.group_use_contacts_checkbox.setChecked(
+                self._to_bool(group_members.get("use_contacts"), self.group_use_contacts_checkbox.isChecked())
+            )
+            self.group_use_usernames_checkbox.setChecked(
+                self._to_bool(group_members.get("use_usernames"), self.group_use_usernames_checkbox.isChecked())
+            )
+            self.group_use_ids_checkbox.setChecked(
+                self._to_bool(group_members.get("use_ids"), self.group_use_ids_checkbox.isChecked())
+            )
+            self.group_contacts_input.setPlainText(str(group_members.get("contacts", "")))
+            self.group_usernames_input.setPlainText(str(group_members.get("usernames", "")))
+            self.group_user_ids_input.setPlainText(str(group_members.get("user_ids", "")))
+
+            group_options = data.get("group_options", {}) if isinstance(data, dict) else {}
+            self._set_combo_by_data(self.group_type_combo, str(group_options.get("type", "normal")))
+            self._set_combo_by_data(self.topic_preset_combo, str(group_options.get("topic_preset", "")))
+            self.topic_custom_input.setText(str(group_options.get("topic_custom", "")))
+
+            self._sync_delay_controls(self.contacts_random_delay_checkbox, self.contacts_delay_min_spin, self.contacts_delay_max_spin)
+            self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
+            self._sync_forum_controls()
+            self._sync_group_member_inputs()
+            self._sync_proxy_controls()
+        finally:
+            self._loading_settings = False
 
     def _save_settings(self) -> None:
         if self._loading_settings:
@@ -528,6 +591,14 @@ class MainWindow(QMainWindow):
             "api": {
                 "api_id": self.api_id_input.text().strip(),
                 "api_hash": self.api_hash_input.text().strip(),
+            },
+            "proxy": {
+                "enabled": self.proxy_enabled_checkbox.isChecked(),
+                "type": self.proxy_type_combo.currentData(),
+                "host": self.proxy_host_input.text().strip(),
+                "port": self.proxy_port_spin.value(),
+                "username": self.proxy_username_input.text(),
+                "password": self.proxy_password_input.text(),
             },
             "account": {
                 "phone": self.account_phone_input.text().strip(),
@@ -605,7 +676,39 @@ class MainWindow(QMainWindow):
             raise ValueError("Укажите телефон текущего аккаунта")
 
         session = self.session_from_phone(phone)
-        return TelegramClient(session, int(api_id), api_hash)
+        proxy = self._build_proxy_config()
+        return TelegramClient(session, int(api_id), api_hash, proxy=proxy)
+
+    def _sync_proxy_controls(self) -> None:
+        enabled = self.proxy_enabled_checkbox.isChecked()
+        self.proxy_type_combo.setEnabled(enabled)
+        self.proxy_host_input.setEnabled(enabled)
+        self.proxy_port_spin.setEnabled(enabled)
+        self.proxy_username_input.setEnabled(enabled)
+        self.proxy_password_input.setEnabled(enabled)
+
+    def _build_proxy_config(self) -> object | None:
+        if not self.proxy_enabled_checkbox.isChecked():
+            return None
+
+        host = self.proxy_host_input.text().strip()
+        if not host:
+            raise ValueError("Укажите хост прокси или выключите прокси")
+
+        try:
+            socks_module = import_module("socks")
+        except Exception as exc:
+            raise ValueError("Для работы прокси установите пакет PySocks: pip install pysocks") from exc
+
+        proxy_type_raw = str(self.proxy_type_combo.currentData() or "socks5").lower()
+        if proxy_type_raw == "http":
+            proxy_type = socks_module.HTTP
+        else:
+            proxy_type = socks_module.SOCKS5
+
+        username = self.proxy_username_input.text().strip() or None
+        password = self.proxy_password_input.text() or None
+        return (proxy_type, host, self.proxy_port_spin.value(), True, username, password)
 
     async def wait_auth_delay(self) -> None:
         delay = self.auth_delay_spin.value()
@@ -682,13 +785,11 @@ class MainWindow(QMainWindow):
 
     def _sync_group_member_inputs(self) -> None:
         use_members = self.use_members_checkbox.isChecked()
-        contacts_enabled = use_members and self.group_use_contacts_checkbox.isChecked()
-        refs_enabled = use_members and self.group_use_usernames_checkbox.isChecked()
-        ids_enabled = use_members and self.group_use_ids_checkbox.isChecked()
-
-        self.group_contacts_input.setEnabled(contacts_enabled)
-        self.group_usernames_input.setEnabled(refs_enabled)
-        self.group_user_ids_input.setEnabled(ids_enabled)
+        # Поля ввода держим доступными, пока включено добавление участников:
+        # это позволяет заранее ввести/вставить данные до выбора конкретного источника.
+        self.group_contacts_input.setEnabled(use_members)
+        self.group_usernames_input.setEnabled(use_members)
+        self.group_user_ids_input.setEnabled(use_members)
 
     def _sync_forum_controls(self) -> None:
         is_forum = self.group_type_combo.currentData() == "forum"
@@ -881,6 +982,28 @@ class MainWindow(QMainWindow):
 
         self.run_task(job, success_cb=_on_code_sent)
 
+    def check_proxy(self) -> None:
+        if not self.proxy_enabled_checkbox.isChecked():
+            self.show_error("Сначала включите прокси")
+            return
+
+        def job() -> str:
+            async def _inner() -> str:
+                client = self._client_from_fields()
+                try:
+                    self.log("[PROXY] Подключение к Telegram через прокси...")
+                    await client.connect()
+                    is_authorized = await client.is_user_authorized()
+                    auth_status = "да" if is_authorized else "нет"
+                    return f"Прокси работает: подключение успешно (авторизация: {auth_status})"
+                finally:
+                    await client.disconnect()
+
+            return self._run_async_task(_inner())
+
+        self.log("[PROXY] Запущена проверка прокси...")
+        self.run_task(job, success_cb=lambda msg: self.log(f"[PROXY] {msg}"))
+
     def sign_in(self) -> None:
         phone = self.normalize_phone(self.phone_input.text())
         code = self.code_input.text().strip()
@@ -1000,12 +1123,54 @@ class MainWindow(QMainWindow):
         self.log("Запущена обработка пользователей...")
         self.run_task(job, success_cb=lambda result: self.log(str(result)))
 
-    def create_groups(self, add_members: bool) -> None:
+    def _on_group_operation_finished(self, result: object) -> None:
+        if isinstance(result, dict):
+            log_text = str(result.get("log", ""))
+            summary_text = str(result.get("summary", ""))
+        else:
+            log_text = str(result)
+            summary_text = str(result)
+
+        if log_text:
+            self.log(log_text)
+
+        if not summary_text:
+            return
+
+        has_failed = bool(self._last_failed_group_indices)
+        can_show_question = all(hasattr(QMessageBox, name) for name in ("question", "Yes", "No"))
+
+        if has_failed and can_show_question:
+            answer = QMessageBox.question(
+                self,
+                "Итог выполнения операций",
+                f"{summary_text}\n\nПовторить неуспешные операции сейчас?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                self.retry_failed_groups()
+            return
+
+        if hasattr(QMessageBox, "information"):
+            QMessageBox.information(self, "Итог выполнения операций", summary_text)
+        else:
+            self.log(f"[SUMMARY] {summary_text}")
+
+    def retry_failed_groups(self) -> None:
+        if not self._last_failed_group_indices:
+            self.show_error("Нет неуспешных операций для повтора")
+            return
+        self.create_groups(add_members=self._last_failed_add_members, retry_indices=self._last_failed_group_indices)
+
+    def create_groups(self, add_members: bool, retry_indices: Optional[list[int]] = None) -> None:
         title = self.group_title_input.text().strip()
         about = self.group_about_input.text().strip()
         cnt = self.group_count_spin.value()
         photo = self.photo_path_input.text().strip()
-        is_forum = self.group_type_combo.currentData() == "forum"
+        group_mode = str(self.group_type_combo.currentData() or "normal")
+        is_forum = group_mode == "forum"
+        is_basic_group = group_mode == "basic"
         topic_title = self.topic_custom_input.text().strip() or str(self.topic_preset_combo.currentData() or "").strip()
 
         if not title:
@@ -1042,12 +1207,18 @@ class MainWindow(QMainWindow):
             if add_members and not (contacts or refs or user_ids):
                 self.show_error("Для добавления участников заполните хотя бы одно выбранное поле в разделе «Группы»")
                 return
+
+            if is_basic_group and not add_members:
+                self.show_error("Обычная группа в Telegram создаётся с участниками. Включите «Добавлять участников» и укажите хотя бы одного пользователя")
+                return
         except Exception as exc:  # noqa: BLE001
             self.show_error(str(exc), exc)
             return
 
+        targets = retry_indices if retry_indices else list(range(cnt))
+
         def job() -> str:
-    
+
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1056,7 +1227,21 @@ class MainWindow(QMainWindow):
                         raise ValueError("Сначала выполните вход")
 
                     users_to_invite = []
-                    logs: list[str] = [f"Старт создания групп: count={cnt}, add_members={add_members}, forum={is_forum}"]
+                    failed_indices: set[int] = set()
+                    stats = {
+                        "targets": len(targets),
+                        "created_ok": 0,
+                        "create_fail": 0,
+                        "topic_ok": 0,
+                        "topic_fail": 0,
+                        "photo_ok": 0,
+                        "photo_fail": 0,
+                        "invite_ok": 0,
+                        "invite_fail": 0,
+                    }
+                    logs: list[str] = [
+                        f"Старт создания групп: targets={len(targets)}, add_members={add_members}, mode={group_mode}, forum={is_forum}"
+                    ]
                     if add_members:
                         if contacts:
                             logs.append(f"Подготовка участников из контактов: {len(contacts)}")
@@ -1091,43 +1276,120 @@ class MainWindow(QMainWindow):
                         users_to_invite = list(uniq.values())
                         logs.append(f"Подготовлено участников после дедупликации: {len(users_to_invite)}")
 
-                    for i in range(cnt):
+                    for idx in targets:
                         await self.wait_groups_delay()
                         gname = title
-                        res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
-                        channel = res.chats[0]
-                        logs.append(f"Создана группа: {gname}")
+                        channel = None
+                        try:
+                            if is_basic_group:
+                                if not users_to_invite:
+                                    raise ValueError("Для создания обычной группы нужен хотя бы 1 участник")
+                                messages_mod = import_module("telethon.tl.functions.messages")
+                                create_chat_request = getattr(messages_mod, "CreateChatRequest")
+                                res = await client(create_chat_request(users=users_to_invite, title=gname))
+                                channel = res.chats[0]
+                                logs.append(f"[{idx + 1}] Создана обычная группа: {gname}")
+                            else:
+                                res = await client(CreateChannelRequest(title=gname, about=about, megagroup=True, forum=is_forum))
+                                channel = res.chats[0]
+                                logs.append(f"[{idx + 1}] Создана супергруппа: {gname}")
+                            stats["created_ok"] += 1
+                        except Exception as exc:
+                            stats["create_fail"] += 1
+                            failed_indices.add(idx)
+                            logs.append(f"[{idx + 1}] Ошибка создания группы: {exc}")
+                            continue
 
-                        if is_forum and topic_title:
-                            await self.wait_groups_delay()
-                            messages_mod = import_module("telethon.tl.functions.messages")
-                            create_topic_request = getattr(messages_mod, "CreateForumTopicRequest")
-                            await client(create_topic_request(peer=channel, title=topic_title))
-                            logs.append(f"Создана тема в {gname}: {topic_title}")
+                        if is_forum and topic_title and channel is not None:
+                            try:
+                                await self.wait_groups_delay()
+                                messages_mod = import_module("telethon.tl.functions.messages")
+                                create_topic_request = getattr(messages_mod, "CreateForumTopicRequest")
+                                await client(create_topic_request(peer=channel, title=topic_title))
+                                logs.append(f"[{idx + 1}] Создана тема: {topic_title}")
+                                stats["topic_ok"] += 1
+                            except Exception as exc:
+                                stats["topic_fail"] += 1
+                                failed_indices.add(idx)
+                                logs.append(f"[{idx + 1}] Ошибка создания темы: {exc}")
 
-                        if photo:
-                            p = Path(photo)
-                            if not p.exists():
-                                raise ValueError(f"Файл фото не найден: {photo}")
-                            await self.wait_groups_delay()
-                            uploaded = await client.upload_file(photo)
-                            await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
+                        if photo and channel is not None:
+                            try:
+                                p = Path(photo)
+                                if not p.exists():
+                                    raise ValueError(f"Файл фото не найден: {photo}")
+                                await self.wait_groups_delay()
+                                uploaded = await client.upload_file(photo)
+                                await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
+                                stats["photo_ok"] += 1
+                            except Exception as exc:
+                                stats["photo_fail"] += 1
+                                failed_indices.add(idx)
+                                logs.append(f"[{idx + 1}] Ошибка установки фото: {exc}")
 
-                        if add_members and users_to_invite:
-                            invited_count = await self._invite_users_batched(client, channel, users_to_invite, logs)
-                            logs.append(f"Добавлено участников в {gname}: {invited_count}")
+                        if add_members and users_to_invite and not is_basic_group and channel is not None:
+                            try:
+                                invited_count = await self._invite_users_batched(client, channel, users_to_invite, logs)
+                                logs.append(f"[{idx + 1}] Добавлено участников: {invited_count}")
+                                stats["invite_ok"] += 1
+                            except Exception as exc:
+                                stats["invite_fail"] += 1
+                                failed_indices.add(idx)
+                                logs.append(f"[{idx + 1}] Ошибка добавления участников: {exc}")
+
+                    self._last_failed_group_indices = sorted(failed_indices)
+                    self._last_failed_add_members = add_members
+                    self.btn_retry_failed_groups.setEnabled(bool(self._last_failed_group_indices))
+
+                    if self._last_failed_group_indices:
+                        logs.append(f"Неуспешные операции по группам: {', '.join(str(i + 1) for i in self._last_failed_group_indices)}")
+                        logs.append("Нажмите «Повторить неуспешные», чтобы попытаться снова только для этих групп")
+                    else:
+                        logs.append("Все операции по группам выполнены успешно")
+
+                    logs.append(
+                        "СТАТИСТИКА: "
+                        f"целей={stats['targets']}, "
+                        f"создано={stats['created_ok']}, ошибок_создания={stats['create_fail']}, "
+                        f"тем_ok={stats['topic_ok']}, тем_fail={stats['topic_fail']}, "
+                        f"фото_ok={stats['photo_ok']}, фото_fail={stats['photo_fail']}, "
+                        f"инвайт_ok={stats['invite_ok']}, инвайт_fail={stats['invite_fail']}"
+                    )
 
                     if not add_members:
-                        logs.append("Группы созданы без участников")
+                        logs.append("Группы создавались без участников")
 
-                    return "\n".join(logs)
+                    summary_lines = [
+                        "Операция завершена.",
+                        f"Целей: {stats['targets']}",
+                        f"Создано групп: {stats['created_ok']}",
+                        f"Ошибок создания: {stats['create_fail']}",
+                        f"Темы ok/fail: {stats['topic_ok']}/{stats['topic_fail']}",
+                        f"Фото ok/fail: {stats['photo_ok']}/{stats['photo_fail']}",
+                        f"Инвайт ok/fail: {stats['invite_ok']}/{stats['invite_fail']}",
+                    ]
+                    if self._last_failed_group_indices:
+                        summary_lines.append(
+                            "Неуспешные группы: " + ", ".join(str(i + 1) for i in self._last_failed_group_indices)
+                        )
+                        summary_lines.append("Можно нажать «Повторить неуспешные»")
+                    else:
+                        summary_lines.append("Все группы обработаны успешно")
+
+                    return {
+                        "log": "\n".join(logs),
+                        "summary": "\n".join(summary_lines),
+                    }
                 finally:
                     await client.disconnect()
 
             return self._run_async_task(_inner())
 
-        self.log("Запущено создание групп...")
-        self.run_task(job, success_cb=lambda result: self.log(str(result)))
+        if retry_indices:
+            self.log("Запущен повтор неуспешных операций...")
+        else:
+            self.log("Запущено создание групп...")
+        self.run_task(job, success_cb=self._on_group_operation_finished)
 
 
 def main() -> None:
