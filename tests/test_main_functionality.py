@@ -55,6 +55,7 @@ if "telethon" not in sys.modules:
 
     errors = types.ModuleType("telethon.errors")
     errors.SessionPasswordNeededError = Exception
+    errors.FloodWaitError = Exception
 
     ch_funcs = types.ModuleType("telethon.tl.functions.channels")
     ch_funcs.CreateChannelRequest = object

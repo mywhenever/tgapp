@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest, InviteToChannelRequest
 from telethon.tl.functions.contacts import ImportContactsRequest
 from telethon.tl.types import InputChatUploadedPhoto, InputPhoneContact
@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self._task_queue: deque[tuple[Callable[[], object], Optional[Callable[[object], None]]]] = deque()
         self._task_in_progress = False
         self.phone_code_hash: Optional[str] = None
+        self._phone_code_target: str = ""
         self._loading_settings = False
 
         # global app credentials (API ID + API HASH) used for login and all operations
@@ -585,6 +586,7 @@ class MainWindow(QMainWindow):
 
     def change_account(self) -> None:
         self.phone_code_hash = None
+        self._phone_code_target = ""
         self.account_phone_input.clear()
         self.phone_input.clear()
         self.code_input.clear()
@@ -857,32 +859,43 @@ class MainWindow(QMainWindow):
 
         def job() -> str:
             async def _inner() -> str:
-                self.log(f"[AUTH] Подготовка клиента для отправки кода. Телефон: {phone}")
                 client = self._client_from_fields()
                 try:
-                    self.log("[AUTH] Подключение к Telegram...")
                     await client.connect()
-                    self.log("[AUTH] Подключение успешно")
                     await self.wait_auth_delay()
-                    self.log("[AUTH] Запрос кода подтверждения...")
                     sent = await client.send_code_request(phone)
-                    self.log("[AUTH] Код запрошен")
                     return sent.phone_code_hash
                 finally:
-                    self.log("[AUTH] Отключение клиента")
                     await client.disconnect()
 
             return self._run_async_task(_inner())
 
-        self.log("[AUTH] Отправка кода...")
-        self.run_task(job, success_cb=lambda h: (setattr(self, "phone_code_hash", str(h)), self.log("[AUTH] Код отправлен")))
+        self.log(f"[AUTH] Отправка кода на {phone}...")
+
+        def _on_code_sent(phone_code_hash: object) -> None:
+            self.phone_code_hash = str(phone_code_hash)
+            self._phone_code_target = phone
+            self.log("[AUTH] Код отправлен. Введите код из Telegram и нажмите «Войти в аккаунт».")
+            self.statusBar().showMessage("Код отправлен. Введите код из Telegram")
+            self.code_input.setFocus()
+
+        self.run_task(job, success_cb=_on_code_sent)
 
     def sign_in(self) -> None:
         phone = self.normalize_phone(self.phone_input.text())
         code = self.code_input.text().strip()
         pwd = self.password_input.text().strip()
+        if not phone:
+            self.show_error("Введите телефон")
+            return
+        if not code:
+            self.show_error("Введите код из Telegram")
+            return
         if not self.phone_code_hash:
             self.show_error("Сначала отправьте код")
+            return
+        if self._phone_code_target and self._phone_code_target != phone:
+            self.show_error("Телефон изменён после запроса кода. Запросите код заново для текущего номера")
             return
 
         def job() -> str:
@@ -929,6 +942,7 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+    
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1033,6 +1047,7 @@ class MainWindow(QMainWindow):
             return
 
         def job() -> str:
+    
             async def _inner() -> str:
                 client = self._client_from_fields()
                 try:
@@ -1099,9 +1114,8 @@ class MainWindow(QMainWindow):
                             await client(EditPhotoRequest(channel=channel, photo=InputChatUploadedPhoto(uploaded)))
 
                         if add_members and users_to_invite:
-                            await self.wait_groups_delay()
-                            await client(InviteToChannelRequest(channel=channel, users=users_to_invite))
-                            logs.append(f"Добавлено участников в {gname}: {len(users_to_invite)}")
+                            invited_count = await self._invite_users_batched(client, channel, users_to_invite, logs)
+                            logs.append(f"Добавлено участников в {gname}: {invited_count}")
 
                     if not add_members:
                         logs.append("Группы созданы без участников")
