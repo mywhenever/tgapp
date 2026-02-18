@@ -69,6 +69,22 @@ class MainWindow(QMainWindow):
         self.api_hash_input.setPlaceholderText("API HASH")
         self.btn_save_api = QPushButton("Сохранить API пару")
 
+        # proxy
+        self.proxy_enabled_checkbox = QCheckBox("Использовать прокси")
+        self.proxy_type_combo = QComboBox()
+        self.proxy_type_combo.addItem("SOCKS5", "socks5")
+        self.proxy_type_combo.addItem("HTTP", "http")
+        self.proxy_host_input = QLineEdit()
+        self.proxy_host_input.setPlaceholderText("127.0.0.1")
+        self.proxy_port_spin = QSpinBox()
+        self.proxy_port_spin.setRange(1, 65535)
+        self.proxy_port_spin.setValue(1080)
+        self.proxy_username_input = QLineEdit()
+        self.proxy_username_input.setPlaceholderText("Логин (опционально)")
+        self.proxy_password_input = QLineEdit()
+        self.proxy_password_input.setPlaceholderText("Пароль (опционально)")
+        self.proxy_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+
         # Active Telegram account (single profile)
         self.account_phone_input = QLineEdit()
         self.account_phone_input.setPlaceholderText("+79990001122")
@@ -237,6 +253,18 @@ class MainWindow(QMainWindow):
         api_form = QFormLayout(api_box)
         api_form.addRow("API ID", self.api_id_input)
         api_form.addRow("API HASH", self.api_hash_input)
+        api_form.addRow("Прокси", self.proxy_enabled_checkbox)
+
+        proxy_addr_row = QWidget()
+        proxy_addr_l = QHBoxLayout(proxy_addr_row)
+        proxy_addr_l.setContentsMargins(0, 0, 0, 0)
+        proxy_addr_l.addWidget(self.proxy_type_combo)
+        proxy_addr_l.addWidget(self.proxy_host_input)
+        proxy_addr_l.addWidget(QLabel(":"))
+        proxy_addr_l.addWidget(self.proxy_port_spin)
+        api_form.addRow("Адрес прокси", proxy_addr_row)
+        api_form.addRow("Логин прокси", self.proxy_username_input)
+        api_form.addRow("Пароль прокси", self.proxy_password_input)
         api_form.addRow("", self.btn_save_api)
         layout.addWidget(api_box)
 
@@ -410,6 +438,14 @@ class MainWindow(QMainWindow):
         self.account_phone_input.textChanged.connect(lambda text: self.phone_input.setText(self.normalize_phone(text)))
         self.account_phone_input.textChanged.connect(self._save_settings)
 
+        self.proxy_enabled_checkbox.toggled.connect(lambda _: self._sync_proxy_controls())
+        self.proxy_enabled_checkbox.toggled.connect(lambda _: self._save_settings())
+        self.proxy_type_combo.currentIndexChanged.connect(lambda _: self._save_settings())
+        self.proxy_host_input.textChanged.connect(self._save_settings)
+        self.proxy_port_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.proxy_username_input.textChanged.connect(self._save_settings)
+        self.proxy_password_input.textChanged.connect(self._save_settings)
+
         self.btn_request_code.clicked.connect(self.request_code)
         self.btn_sign_in.clicked.connect(self.sign_in)
         self.btn_pick_photo.clicked.connect(self.pick_photo)
@@ -471,6 +507,14 @@ class MainWindow(QMainWindow):
         self.api_id_input.setText(str(api.get("api_id", "")).strip())
         self.api_hash_input.setText(str(api.get("api_hash", "")).strip())
 
+        proxy = data.get("proxy", {}) if isinstance(data, dict) else {}
+        self.proxy_enabled_checkbox.setChecked(self._to_bool(proxy.get("enabled"), self.proxy_enabled_checkbox.isChecked()))
+        self._set_combo_by_data(self.proxy_type_combo, str(proxy.get("type", "socks5")))
+        self.proxy_host_input.setText(str(proxy.get("host", "")).strip())
+        self.proxy_port_spin.setValue(self._to_int(proxy.get("port"), self.proxy_port_spin.value()))
+        self.proxy_username_input.setText(str(proxy.get("username", "")))
+        self.proxy_password_input.setText(str(proxy.get("password", "")))
+
         account = data.get("account", {}) if isinstance(data, dict) else {}
         if not account and isinstance(data, dict):
             # backward compatibility with old accounts list format
@@ -519,6 +563,7 @@ class MainWindow(QMainWindow):
         self._sync_delay_controls(self.groups_random_delay_checkbox, self.groups_delay_min_spin, self.groups_delay_max_spin)
         self._sync_forum_controls()
         self._sync_group_member_inputs()
+        self._sync_proxy_controls()
         self._loading_settings = False
 
     def _save_settings(self) -> None:
@@ -528,6 +573,14 @@ class MainWindow(QMainWindow):
             "api": {
                 "api_id": self.api_id_input.text().strip(),
                 "api_hash": self.api_hash_input.text().strip(),
+            },
+            "proxy": {
+                "enabled": self.proxy_enabled_checkbox.isChecked(),
+                "type": self.proxy_type_combo.currentData(),
+                "host": self.proxy_host_input.text().strip(),
+                "port": self.proxy_port_spin.value(),
+                "username": self.proxy_username_input.text(),
+                "password": self.proxy_password_input.text(),
             },
             "account": {
                 "phone": self.account_phone_input.text().strip(),
@@ -605,7 +658,39 @@ class MainWindow(QMainWindow):
             raise ValueError("Укажите телефон текущего аккаунта")
 
         session = self.session_from_phone(phone)
-        return TelegramClient(session, int(api_id), api_hash)
+        proxy = self._build_proxy_config()
+        return TelegramClient(session, int(api_id), api_hash, proxy=proxy)
+
+    def _sync_proxy_controls(self) -> None:
+        enabled = self.proxy_enabled_checkbox.isChecked()
+        self.proxy_type_combo.setEnabled(enabled)
+        self.proxy_host_input.setEnabled(enabled)
+        self.proxy_port_spin.setEnabled(enabled)
+        self.proxy_username_input.setEnabled(enabled)
+        self.proxy_password_input.setEnabled(enabled)
+
+    def _build_proxy_config(self) -> object | None:
+        if not self.proxy_enabled_checkbox.isChecked():
+            return None
+
+        host = self.proxy_host_input.text().strip()
+        if not host:
+            raise ValueError("Укажите хост прокси или выключите прокси")
+
+        try:
+            socks_module = import_module("socks")
+        except Exception as exc:
+            raise ValueError("Для работы прокси установите пакет PySocks: pip install pysocks") from exc
+
+        proxy_type_raw = str(self.proxy_type_combo.currentData() or "socks5").lower()
+        if proxy_type_raw == "http":
+            proxy_type = socks_module.HTTP
+        else:
+            proxy_type = socks_module.SOCKS5
+
+        username = self.proxy_username_input.text().strip() or None
+        password = self.proxy_password_input.text() or None
+        return (proxy_type, host, self.proxy_port_spin.value(), True, username, password)
 
     async def wait_auth_delay(self) -> None:
         delay = self.auth_delay_spin.value()
@@ -682,13 +767,11 @@ class MainWindow(QMainWindow):
 
     def _sync_group_member_inputs(self) -> None:
         use_members = self.use_members_checkbox.isChecked()
-        contacts_enabled = use_members and self.group_use_contacts_checkbox.isChecked()
-        refs_enabled = use_members and self.group_use_usernames_checkbox.isChecked()
-        ids_enabled = use_members and self.group_use_ids_checkbox.isChecked()
-
-        self.group_contacts_input.setEnabled(contacts_enabled)
-        self.group_usernames_input.setEnabled(refs_enabled)
-        self.group_user_ids_input.setEnabled(ids_enabled)
+        # Поля ввода держим доступными, пока включено добавление участников:
+        # это позволяет заранее ввести/вставить данные до выбора конкретного источника.
+        self.group_contacts_input.setEnabled(use_members)
+        self.group_usernames_input.setEnabled(use_members)
+        self.group_user_ids_input.setEnabled(use_members)
 
     def _sync_forum_controls(self) -> None:
         is_forum = self.group_type_combo.currentData() == "forum"
