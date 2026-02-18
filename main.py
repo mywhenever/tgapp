@@ -3,6 +3,7 @@ import json
 import random
 import re
 import sys
+import traceback
 from collections import deque
 from importlib import import_module
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSpinBox,
@@ -725,7 +725,7 @@ class MainWindow(QMainWindow):
             if success_cb:
                 success_cb(result)
         except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc))
+            self.show_error(str(exc), exc)
         finally:
             self._process_next_task()
 
@@ -735,9 +735,11 @@ class MainWindow(QMainWindow):
     def log(self, text: str) -> None:
         self.log_output.appendPlainText(text)
 
-    def show_error(self, text: str) -> None:
+    def show_error(self, text: str, exc: Exception | None = None) -> None:
         self.log(f"[ОШИБКА] {text}")
-        QMessageBox.critical(self, "Ошибка", text)
+        print(f"[ОШИБКА] {text}", file=sys.stderr)
+        if exc is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     @staticmethod
     def normalize_phone(phone: str) -> str:
@@ -923,7 +925,7 @@ class MainWindow(QMainWindow):
             refs = self.parse_user_refs(refs_raw) if refs_raw.strip() else []
             user_ids = self.parse_user_ids(ids_raw) if ids_raw.strip() else []
         except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc))
+            self.show_error(str(exc), exc)
             return
 
         def job() -> str:
@@ -1027,7 +1029,7 @@ class MainWindow(QMainWindow):
                 self.show_error("Для добавления участников заполните хотя бы одно выбранное поле в разделе «Группы»")
                 return
         except Exception as exc:  # noqa: BLE001
-            self.show_error(str(exc))
+            self.show_error(str(exc), exc)
             return
 
         def job() -> str:
